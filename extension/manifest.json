@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "USB freeD — 3D IMU Mouse",
+  "version": "1.0.0",
+  "description": "Use a CodeCell C6 IMU as a 3D mouse to orbit and pan in Onshape",
+  "content_scripts": [
+    {
+      "matches": ["https://*.onshape.com/*"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {}
+}

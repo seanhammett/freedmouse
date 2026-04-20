@@ -1,0 +1,138 @@
+/* USB freeD — Floating Control Panel */
+
+#usb-freed-panel {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  width: 280px;
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 8px;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 12px;
+  color: #cdd6f4;
+  z-index: 999999;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  user-select: none;
+}
+
+.usb-freed-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  background: #313244;
+  border-radius: 8px 8px 0 0;
+  cursor: move;
+}
+
+.usb-freed-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.usb-freed-minimize {
+  background: none;
+  border: none;
+  color: #cdd6f4;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.usb-freed-body {
+  padding: 8px 10px;
+}
+
+.usb-freed-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.usb-freed-btn {
+  flex: 1;
+  padding: 5px 8px;
+  background: #45475a;
+  border: 1px solid #585b70;
+  border-radius: 4px;
+  color: #cdd6f4;
+  font-size: 11px;
+  cursor: pointer;
+  text-align: center;
+}
+
+.usb-freed-btn:hover {
+  background: #585b70;
+}
+
+.usb-freed-btn-connect {
+  background: #89b4fa;
+  color: #1e1e2e;
+  font-weight: 600;
+}
+
+.usb-freed-btn-connect:hover {
+  background: #74c7ec;
+}
+
+.usb-freed-btn-danger {
+  background: #f38ba8;
+  color: #1e1e2e;
+}
+
+.usb-freed-btn-danger:hover {
+  background: #eba0ac;
+}
+
+.usb-freed-btn-active {
+  background: #a6e3a1;
+  color: #1e1e2e;
+  font-weight: 600;
+}
+
+.usb-freed-label {
+  font-size: 11px;
+  color: #a6adc8;
+  white-space: nowrap;
+}
+
+.usb-freed-slider {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: #45475a;
+  border-radius: 2px;
+  outline: none;
+}
+
+.usb-freed-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #89b4fa;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.usb-freed-data {
+  background: #11111b;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 10px;
+  white-space: pre;
+  color: #a6adc8;
+  margin-bottom: 6px;
+  min-height: 28px;
+}
+
+.usb-freed-status {
+  font-size: 11px;
+  color: #f87171;
+  text-align: center;
+  padding: 2px;
+}
