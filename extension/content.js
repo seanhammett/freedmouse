@@ -8,15 +8,18 @@
   const STORAGE_KEY = 'usbFreeDWidgetWatcherConfig';
   const SCAN_INTERVAL_MS = 220;
   const STALE_MS = 1600;
+  const BUILD_TAG = 'watcher-2026-04-22-safe-2';
 
   let config = loadConfig();
 
+  let observerRawQuat = null;
   let observerQuat = null;
   let observerStrategy = 'none';
   let observerConfidence = 0;
   let observerDebug = 'idle';
   let observerLastUpdateMs = 0;
   let observerLastScanMs = 0;
+  let observerLastError = null;
 
   let panel = null;
   let statusEl = null;
@@ -26,21 +29,59 @@
   let fallbackBtn = null;
   let smoothSlider = null;
   let smoothVal = null;
+  let calibrateBtn = null;
+  let clearCalBtn = null;
   let previewCanvas = null;
   let previewCtx = null;
+
+  function setLastError(kind, err, extra) {
+    const msg = String(err && err.message ? err.message : err);
+    observerLastError = {
+      at: Date.now(),
+      kind,
+      message: msg,
+      stack: err && err.stack ? String(err.stack) : '',
+      extra: extra || null,
+    };
+  }
+
+  function installGlobalErrorHooks() {
+    window.addEventListener('error', (ev) => {
+      const err = ev && ev.error ? ev.error : new Error(ev && ev.message ? ev.message : 'unknown window error');
+      const info = {
+        source: ev && ev.filename ? ev.filename : '',
+        line: ev && Number.isFinite(ev.lineno) ? ev.lineno : 0,
+        column: ev && Number.isFinite(ev.colno) ? ev.colno : 0,
+      };
+      setLastError('window.error', err, info);
+      console.error('[USB_freeD] window error (' + BUILD_TAG + ')', info, err);
+    });
+
+    window.addEventListener('unhandledrejection', (ev) => {
+      const reason = ev ? ev.reason : null;
+      const err = reason instanceof Error ? reason : new Error(String(reason));
+      setLastError('window.unhandledrejection', err, null);
+      console.error('[USB_freeD] unhandled rejection (' + BUILD_TAG + ')', err);
+    });
+  }
 
   function defaultConfig() {
     return {
       watcherEnabled: true,
-      fallbackMode: 'auto',
+      fallbackMode: 'labels',
       smoothing: 0.3,
+      frameCalibration: null,
     };
   }
 
   function loadConfig() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) return { ...defaultConfig(), ...JSON.parse(raw) };
+      if (raw) {
+        const cfg = { ...defaultConfig(), ...JSON.parse(raw) };
+        cfg.fallbackMode = normalizeFallbackMode(cfg.fallbackMode);
+        return cfg;
+      }
     } catch (e) {
       // ignore malformed config
     }
@@ -55,27 +96,116 @@
     }
   }
 
+  function sanitizeStoredQuat(q) {
+    if (!q || typeof q !== 'object') return null;
+    const qq = {
+      w: Number(q.w),
+      x: Number(q.x),
+      y: Number(q.y),
+      z: Number(q.z),
+    };
+    return quatNormalize(qq);
+  }
+
   function quatNormalize(q) {
+    if (!q || typeof q !== 'object') return null;
+    if (!Number.isFinite(q.w) || !Number.isFinite(q.x) || !Number.isFinite(q.y) || !Number.isFinite(q.z)) return null;
     const n = Math.sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
     if (n < 1e-9 || !Number.isFinite(n)) return null;
     return { w: q.w / n, x: q.x / n, y: q.y / n, z: q.z / n };
   }
 
   function quatDot(a, b) {
-    return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+    const aa = quatNormalize(a);
+    const bb = quatNormalize(b);
+    if (!aa || !bb) return 0;
+    return aa.w * bb.w + aa.x * bb.x + aa.y * bb.y + aa.z * bb.z;
   }
 
   function quatLerp(a, b, t) {
-    let bb = b;
-    if (quatDot(a, b) < 0) {
-      bb = { w: -b.w, x: -b.x, y: -b.y, z: -b.z };
+    const aa = quatNormalize(a);
+    let bb = quatNormalize(b);
+    if (!aa && !bb) return null;
+    if (!aa) return bb;
+    if (!bb) return aa;
+
+    if (quatDot(aa, bb) < 0) {
+      bb = { w: -bb.w, x: -bb.x, y: -bb.y, z: -bb.z };
     }
     return quatNormalize({
-      w: a.w + (bb.w - a.w) * t,
-      x: a.x + (bb.x - a.x) * t,
-      y: a.y + (bb.y - a.y) * t,
-      z: a.z + (bb.z - a.z) * t,
+      w: aa.w + (bb.w - aa.w) * t,
+      x: aa.x + (bb.x - aa.x) * t,
+      y: aa.y + (bb.y - aa.y) * t,
+      z: aa.z + (bb.z - aa.z) * t,
     });
+  }
+
+  function quatConjugate(q) {
+    const qq = quatNormalize(q);
+    if (!qq) return null;
+    return { w: qq.w, x: -qq.x, y: -qq.y, z: -qq.z };
+  }
+
+  function quatMultiply(a, b) {
+    const aa = quatNormalize(a);
+    const bb = quatNormalize(b);
+    if (!aa || !bb) return null;
+    return {
+      w: aa.w * bb.w - aa.x * bb.x - aa.y * bb.y - aa.z * bb.z,
+      x: aa.w * bb.x + aa.x * bb.w + aa.y * bb.z - aa.z * bb.y,
+      y: aa.w * bb.y - aa.x * bb.z + aa.y * bb.w + aa.z * bb.x,
+      z: aa.w * bb.z + aa.x * bb.y - aa.y * bb.x + aa.z * bb.w,
+    };
+  }
+
+  function quatInverse(q) {
+    const qq = quatNormalize(q);
+    if (!qq) return null;
+    const n2 = qq.w * qq.w + qq.x * qq.x + qq.y * qq.y + qq.z * qq.z;
+    if (n2 < 1e-9 || !Number.isFinite(n2)) return null;
+    const c = quatConjugate(qq);
+    if (!c) return null;
+    return { w: c.w / n2, x: c.x / n2, y: c.y / n2, z: c.z / n2 };
+  }
+
+  function getCalibrationQuat() {
+    return sanitizeStoredQuat(config.frameCalibration);
+  }
+
+  function applyFrameCalibration(rawQuat) {
+    const q = quatNormalize(rawQuat);
+    if (!q) return null;
+
+    const fix = getCalibrationQuat();
+    if (!fix) return q;
+
+    const corrected = quatMultiply(fix, q);
+    return quatNormalize(corrected);
+  }
+
+  function calibrationEnabled() {
+    return !!getCalibrationQuat();
+  }
+
+  function setCalibrationQuat(q) {
+    config.frameCalibration = q ? { w: q.w, x: q.x, y: q.y, z: q.z } : null;
+    saveConfig();
+  }
+
+  function calibrateCurrentAsFront() {
+    if (!observerRawQuat || observerIsStale()) return false;
+    const inv = quatInverse(observerRawQuat);
+    if (!inv) return false;
+    setCalibrationQuat(inv);
+    observerQuat = applyFrameCalibration(observerRawQuat);
+    observerDebug = 'frame aligned: current orientation mapped to Front';
+    return true;
+  }
+
+  function clearCalibration() {
+    setCalibrationQuat(null);
+    observerQuat = applyFrameCalibration(observerRawQuat);
+    observerDebug = 'frame alignment cleared';
   }
 
   function quatToEuler(q) {
@@ -353,8 +483,20 @@
     return basisColumnsToQuat(xCol, yCol, zCol);
   }
 
+  function normalizeFallbackMode(mode) {
+    if (mode === 'matrix' || mode === 'labels' || mode === 'legacy-pixels') return mode;
+    return mode === 'auto' ? 'labels' : 'labels';
+  }
+
+  function fallbackModeLabel(mode) {
+    const m = normalizeFallbackMode(mode);
+    if (m === 'matrix') return 'Mode: Matrix';
+    if (m === 'legacy-pixels') return 'Mode: Legacy Pixels';
+    return 'Mode: Labels';
+  }
+
   function observerIsStale(nowMs = performance.now()) {
-    return !observerQuat || (nowMs - observerLastUpdateMs) > STALE_MS;
+    return !observerRawQuat || (nowMs - observerLastUpdateMs) > STALE_MS;
   }
 
   function inWidgetZone(rect) {
@@ -540,6 +682,180 @@
     };
   }
 
+  function collectWidgetLabels(candidates, anchor) {
+    const out = {
+      axis: { x: [], y: [], z: [] },
+      faces: { front: [], back: [], left: [], right: [], top: [], bottom: [] },
+      counts: { scanned: 0, accepted: 0 },
+      samples: [],
+    };
+
+    if (!anchor) return out;
+
+    const anchorRect = anchor.getBoundingClientRect();
+    const searchRect = expandRect(anchorRect, 55);
+    const anchorCenter = centerOfRect(anchorRect);
+    const pool = new Set();
+
+    const addNode = (el) => {
+      if (!el || pool.has(el)) return;
+      const r = el.getBoundingClientRect();
+      if (!Number.isFinite(r.width) || !Number.isFinite(r.height)) return;
+      if (r.width <= 0 || r.height <= 0) return;
+      if (!rectIntersects(r, searchRect)) return;
+      pool.add(el);
+    };
+
+    for (const el of candidates) addNode(el);
+
+    if (anchor.parentElement && anchor.parentElement.querySelectorAll) {
+      addNode(anchor.parentElement);
+      let inspected = 0;
+      for (const el of anchor.parentElement.querySelectorAll('*')) {
+        addNode(el);
+        inspected++;
+        if (inspected >= 400) break;
+      }
+    }
+
+    const x0 = Math.max(0, anchorRect.left - 10);
+    const y0 = Math.max(0, anchorRect.top - 10);
+    const x1 = Math.min(window.innerWidth - 1, anchorRect.right + 10);
+    const y1 = Math.min(window.innerHeight - 1, anchorRect.bottom + 10);
+    const cols = 5;
+    const rows = 5;
+    for (let yi = 0; yi < rows; yi++) {
+      for (let xi = 0; xi < cols; xi++) {
+        const px = x0 + (x1 - x0) * ((xi + 0.5) / cols);
+        const py = y0 + (y1 - y0) * ((yi + 0.5) / rows);
+        for (const hit of document.elementsFromPoint(px, py).slice(0, 16)) {
+          let node = hit;
+          for (let depth = 0; depth < 4 && node; depth++) {
+            addNode(node);
+            node = node.parentElement;
+          }
+        }
+      }
+    }
+
+    const faceWords = new Set(['front', 'back', 'left', 'right', 'top', 'bottom']);
+    const pushSample = (source, raw) => {
+      if (!raw) return;
+      const t = String(raw).trim();
+      if (!t) return;
+      if (out.samples.length >= 36) return;
+      out.samples.push({ source, raw: t.slice(0, 48) });
+    };
+
+    const tokenize = (raw) => {
+      if (!raw) return [];
+      const normalized = String(raw).toLowerCase().replace(/[^a-z]+/g, ' ').trim();
+      if (!normalized) return [];
+      return normalized.split(/\s+/);
+    };
+
+    const addToken = (token, el, source) => {
+      if (!token) return;
+      const t = token.toLowerCase();
+      if (t !== 'x' && t !== 'y' && t !== 'z' && !faceWords.has(t)) return;
+
+      const r = el.getBoundingClientRect();
+      const c = centerOfRect(r);
+      const dist = Math.hypot(c.x - anchorCenter.x, c.y - anchorCenter.y);
+      const entry = {
+        token: t,
+        center: c,
+        dist,
+        area: r.width * r.height,
+        source,
+        tag: (el.tagName || '').toLowerCase(),
+      };
+
+      if (t === 'x' || t === 'y' || t === 'z') out.axis[t].push(entry);
+      else out.faces[t].push(entry);
+      out.counts.accepted++;
+    };
+
+    for (const el of pool) {
+      out.counts.scanned++;
+      const r = el.getBoundingClientRect();
+      if (r.width > 140 || r.height > 140) continue;
+
+      const rawTexts = [];
+      const tc = (el.textContent || '').trim();
+      if (tc && tc.length <= 24) rawTexts.push(tc);
+
+      const aria = el.getAttribute && el.getAttribute('aria-label');
+      if (aria && aria.trim().length <= 24) rawTexts.push(aria.trim());
+
+      const title = el.getAttribute && el.getAttribute('title');
+      if (title && title.trim().length <= 24) rawTexts.push(title.trim());
+
+      if (el.id && el.id.length <= 48) rawTexts.push(el.id);
+      if (typeof el.className === 'string' && el.className.trim() && el.className.length <= 120) rawTexts.push(el.className);
+
+      if (el.attributes && el.attributes.length) {
+        for (let i = 0; i < el.attributes.length; i++) {
+          const attr = el.attributes[i];
+          if (!attr) continue;
+          if (attr.name && attr.name.length <= 40) rawTexts.push(attr.name);
+          if (attr.value && attr.value.length <= 64) rawTexts.push(attr.value);
+        }
+      }
+
+      const before = window.getComputedStyle(el, '::before').content;
+      const after = window.getComputedStyle(el, '::after').content;
+      if (before && before !== 'none') rawTexts.push(before.replace(/^['"]|['"]$/g, ''));
+      if (after && after !== 'none') rawTexts.push(after.replace(/^['"]|['"]$/g, ''));
+
+      for (const raw of rawTexts) {
+        pushSample('raw', raw);
+        const tokens = tokenize(raw);
+        for (const token of tokens) {
+          addToken(token, el, 'text');
+        }
+      }
+    }
+
+    return out;
+  }
+
+  function pickBestLabel(entries) {
+    if (!entries || !entries.length) return null;
+    let best = null;
+    for (const e of entries) {
+      const score = e.dist * 1.15 + Math.min(20, Math.sqrt(Math.max(0, e.area)) * 0.5);
+      if (!best || score > best.score) best = { entry: e, score };
+    }
+    return best ? best.entry : null;
+  }
+
+  function debugDumpLabels() {
+    const info = collectWidgetCandidates();
+    const labels = collectWidgetLabels(info.candidates, info.anchor);
+    const summarize = (obj) => {
+      const out = {};
+      for (const key of Object.keys(obj)) {
+        out[key] = obj[key].slice(0, 4).map((e) => ({
+          dist: Math.round(e.dist * 10) / 10,
+          x: Math.round(e.center.x),
+          y: Math.round(e.center.y),
+          tag: e.tag,
+          source: e.source,
+        }));
+      }
+      return out;
+    };
+
+    return {
+      anchor: info.anchor ? elementSummary(info.anchor) : null,
+      counts: labels.counts,
+      axis: summarize(labels.axis),
+      faces: summarize(labels.faces),
+      samples: labels.samples,
+    };
+  }
+
   function extractFromCssMatrix(candidates) {
     for (const el of candidates) {
       let node = el;
@@ -652,47 +968,33 @@
     return null;
   }
 
-  function extractFromHtmlAxisLabels(candidates, anchor) {
-    if (!anchor) return null;
+  function extractFromHtmlAxisLabels(labels, anchor) {
+    if (!anchor || !labels) return null;
 
     const anchorRect = anchor.getBoundingClientRect();
-    const searchRect = expandRect(anchorRect, 35);
-    const bins = { x: [], y: [], z: [] };
-
-    for (const el of candidates) {
-      if (!el || !el.textContent) continue;
-      const text = el.textContent.trim().toLowerCase();
-      if (text !== 'x' && text !== 'y' && text !== 'z') continue;
-
-      const rect = el.getBoundingClientRect();
-      if (!rectIntersects(rect, searchRect)) continue;
-      if (rect.width > 50 || rect.height > 50) continue;
-
-      const c = centerOfRect(rect);
-      const ac = centerOfRect(anchorRect);
-      const dist = Math.hypot(c.x - ac.x, c.y - ac.y);
-      if (dist < 8) continue;
-
-      bins[text].push({ center: c, dist });
-    }
-
-    if (!bins.x.length || !bins.y.length || !bins.z.length) return null;
-
-    const pickFarthest = (arr) => arr.sort((a, b) => b.dist - a.dist)[0].center;
-    const px = pickFarthest(bins.x);
-    const py = pickFarthest(bins.y);
-    const pz = pickFarthest(bins.z);
-
-    const origin = {
-      x: (px.x + py.x + pz.x) / 3,
-      y: (px.y + py.y + pz.y) / 3,
+    const origin = centerOfRect(anchorRect);
+    const selected = {
+      x: pickBestLabel(labels.axis.x),
+      y: pickBestLabel(labels.axis.y),
+      z: pickBestLabel(labels.axis.z),
     };
 
-    const vx = [px.x - origin.x, px.y - origin.y];
-    const vy = [py.x - origin.x, py.y - origin.y];
-    const vz = [pz.x - origin.x, pz.y - origin.y];
-    const maxLen = Math.max(Math.hypot(vx[0], vx[1]), Math.hypot(vy[0], vy[1]), Math.hypot(vz[0], vz[1]));
-    if (maxLen < 8) return null;
+    const axisData = {};
+    const presentAxes = [];
+    for (const key of ['x', 'y', 'z']) {
+      const pick = selected[key];
+      if (!pick) continue;
+      const v2 = [pick.center.x - origin.x, pick.center.y - origin.y];
+      const len = Math.hypot(v2[0], v2[1]);
+      if (len < 3.8) continue;
+      axisData[key] = { v2, len };
+      presentAxes.push(key);
+    }
+
+    if (presentAxes.length < 2) return null;
+
+    const maxLen = Math.max(...presentAxes.map((k) => axisData[k].len));
+    if (!Number.isFinite(maxLen) || maxLen < 4.2) return null;
 
     const toAxis = (v) => {
       const sx = Math.max(-0.98, Math.min(0.98, v[0] / maxLen));
@@ -701,34 +1003,162 @@
       return [sx, sy, szAbs];
     };
 
-    const xBase = toAxis(vx);
-    const yBase = toAxis(vy);
-    const zBase = toAxis(vz);
+    const base = {};
+    for (const key of presentAxes) base[key] = toAxis(axisData[key].v2);
 
     let best = null;
-    for (const sx of [-1, 1]) {
-      for (const sy of [-1, 1]) {
-        for (const sz of [-1, 1]) {
-          const cx = [xBase[0], xBase[1], xBase[2] * sx];
-          const cy = [yBase[0], yBase[1], yBase[2] * sy];
-          const cz = [zBase[0], zBase[1], zBase[2] * sz];
-          const q = basisColumnsToQuat(cx, cy, cz);
-          if (!q) continue;
-
-          const hand = vecDot(vecCross(cx, cy), cz);
-          const score = hand > 0 ? hand : hand - 3;
-          if (!best || score > best.score) best = { quat: q, score };
-        }
+    const combos = 1 << presentAxes.length;
+    for (let mask = 0; mask < combos; mask++) {
+      const cols = { x: null, y: null, z: null };
+      for (let i = 0; i < presentAxes.length; i++) {
+        const key = presentAxes[i];
+        const s = ((mask >> i) & 1) ? -1 : 1;
+        const b = base[key];
+        cols[key] = [b[0], b[1], b[2] * s];
       }
+
+      if (!cols.x && cols.y && cols.z) cols.x = vecNorm(vecCross(cols.y, cols.z));
+      if (!cols.y && cols.z && cols.x) cols.y = vecNorm(vecCross(cols.z, cols.x));
+      if (!cols.z && cols.x && cols.y) cols.z = vecNorm(vecCross(cols.x, cols.y));
+      if (!cols.x || !cols.y || !cols.z) continue;
+
+      const q = basisColumnsToQuat(cols.x, cols.y, cols.z);
+      if (!q) continue;
+
+      const hand = vecDot(vecCross(cols.x, cols.y), cols.z);
+      const continuity = observerRawQuat ? Math.abs(quatDot(q, observerRawQuat)) : 0.5;
+
+      let projectionFit = 0;
+      for (const key of presentAxes) {
+        const v = axisData[key].v2;
+        const n = Math.hypot(v[0], v[1]);
+        if (n < 1e-6) continue;
+        const measured = [v[0] / n, v[1] / n];
+        const c = cols[key];
+        const projected = [c[0], -c[1]];
+        const pn = Math.hypot(projected[0], projected[1]);
+        if (pn < 1e-6) continue;
+        projectionFit += (projected[0] / pn) * measured[0] + (projected[1] / pn) * measured[1];
+      }
+
+      const score = hand * 0.85 + continuity * 0.7 + projectionFit * 0.35;
+      if (!best || score > best.score) best = { quat: q, score };
     }
 
     if (!best) return null;
 
+    const confidence = presentAxes.length === 3 ? 0.82 : 0.73;
     return {
       quat: best.quat,
-      confidence: 0.74,
-      strategy: 'html-axis-labels',
-      debug: 'orientation inferred from HTML X/Y/Z label positions',
+      confidence,
+      strategy: presentAxes.length === 3 ? 'html-axis-labels' : 'html-axis-labels-partial',
+      debug: 'orientation inferred from HTML X/Y/Z labels (' + presentAxes.join(',') + ')',
+    };
+  }
+
+  function extractFromFaceLabels(labels, anchor) {
+    if (!anchor || !labels) return null;
+
+    const faceMap = {
+      right: { axis: 'x', sign: 1 },
+      left: { axis: 'x', sign: -1 },
+      top: { axis: 'y', sign: 1 },
+      bottom: { axis: 'y', sign: -1 },
+      front: { axis: 'z', sign: 1 },
+      back: { axis: 'z', sign: -1 },
+    };
+
+    const axisChoice = { x: null, y: null, z: null };
+    for (const face of Object.keys(faceMap)) {
+      const picked = pickBestLabel(labels.faces[face]);
+      if (!picked) continue;
+      const info = faceMap[face];
+      const existing = axisChoice[info.axis];
+      if (!existing || picked.dist > existing.entry.dist) {
+        axisChoice[info.axis] = { face, sign: info.sign, entry: picked };
+      }
+    }
+
+    const origin = centerOfRect(anchor.getBoundingClientRect());
+    const presentAxes = [];
+    const axisData = {};
+
+    for (const axis of ['x', 'y', 'z']) {
+      const c = axisChoice[axis];
+      if (!c) continue;
+      const v2 = [c.entry.center.x - origin.x, c.entry.center.y - origin.y];
+      const len = Math.hypot(v2[0], v2[1]);
+      if (len < 3.6) continue;
+      axisData[axis] = { v2, len, sign: c.sign, face: c.face };
+      presentAxes.push(axis);
+    }
+
+    if (presentAxes.length < 2) return null;
+
+    const maxLen = Math.max(...presentAxes.map((k) => axisData[k].len));
+    if (!Number.isFinite(maxLen) || maxLen < 4.0) return null;
+
+    const toAxis = (v) => {
+      const sx = Math.max(-0.98, Math.min(0.98, v[0] / maxLen));
+      const sy = Math.max(-0.98, Math.min(0.98, -v[1] / maxLen));
+      const szAbs = Math.sqrt(Math.max(0, 1 - sx * sx - sy * sy));
+      return [sx, sy, szAbs];
+    };
+
+    const base = {};
+    for (const axis of presentAxes) base[axis] = toAxis(axisData[axis].v2);
+
+    let best = null;
+    const combos = 1 << presentAxes.length;
+    for (let mask = 0; mask < combos; mask++) {
+      const cols = { x: null, y: null, z: null };
+
+      for (let i = 0; i < presentAxes.length; i++) {
+        const axis = presentAxes[i];
+        const s = ((mask >> i) & 1) ? -1 : 1;
+        const b = base[axis];
+        const faceDir = [b[0], b[1], b[2] * s];
+        cols[axis] = vecScale(faceDir, axisData[axis].sign);
+      }
+
+      if (!cols.x && cols.y && cols.z) cols.x = vecNorm(vecCross(cols.y, cols.z));
+      if (!cols.y && cols.z && cols.x) cols.y = vecNorm(vecCross(cols.z, cols.x));
+      if (!cols.z && cols.x && cols.y) cols.z = vecNorm(vecCross(cols.x, cols.y));
+      if (!cols.x || !cols.y || !cols.z) continue;
+
+      const q = basisColumnsToQuat(cols.x, cols.y, cols.z);
+      if (!q) continue;
+
+      const hand = vecDot(vecCross(cols.x, cols.y), cols.z);
+      const continuity = observerRawQuat ? Math.abs(quatDot(q, observerRawQuat)) : 0.5;
+
+      let projectionFit = 0;
+      for (const axis of presentAxes) {
+        const c = cols[axis];
+        const faceDir = vecScale(c, axisData[axis].sign);
+        const projected = [faceDir[0], -faceDir[1]];
+        const pn = Math.hypot(projected[0], projected[1]);
+        if (pn < 1e-6) continue;
+
+        const v = axisData[axis].v2;
+        const vn = Math.hypot(v[0], v[1]);
+        if (vn < 1e-6) continue;
+
+        projectionFit += (projected[0] / pn) * (v[0] / vn) + (projected[1] / pn) * (v[1] / vn);
+      }
+
+      const score = hand * 0.9 + continuity * 0.6 + projectionFit * 0.5;
+      if (!best || score > best.score) best = { quat: q, score };
+    }
+
+    if (!best) return null;
+
+    const confidence = presentAxes.length === 3 ? 0.79 : 0.69;
+    return {
+      quat: best.quat,
+      confidence,
+      strategy: presentAxes.length === 3 ? 'html-face-labels' : 'html-face-labels-partial',
+      debug: 'orientation inferred from face labels (' + presentAxes.map((a) => axisData[a].face).join(',') + ')',
     };
   }
 
@@ -1049,23 +1479,35 @@
     const info = collectWidgetCandidates();
     const candidates = info.candidates;
     let sample = extractFromCssMatrix(candidates);
+    const mode = normalizeFallbackMode(config.fallbackMode);
+    const labels = collectWidgetLabels(candidates, info.anchor);
+    const axisVisible = ['x', 'y', 'z'].filter((k) => labels.axis[k].length > 0).length;
+    const faceVisible = ['front', 'back', 'left', 'right', 'top', 'bottom'].filter((k) => labels.faces[k].length > 0).length;
     let unresolvedReason = '';
 
-    if (!sample && config.fallbackMode === 'auto') {
+    if (!sample && mode !== 'matrix') {
       sample = extractFromSvgLabels(candidates);
     }
 
-    if (!sample && config.fallbackMode === 'auto') {
-      sample = extractFromHtmlAxisLabels(candidates, info.anchor);
+    if (!sample && mode !== 'matrix') {
+      sample = extractFromHtmlAxisLabels(labels, info.anchor);
     }
 
-    if (!sample && config.fallbackMode === 'auto') {
+    if (!sample && mode !== 'matrix') {
+      sample = extractFromFaceLabels(labels, info.anchor);
+    }
+
+    if (!sample && mode === 'legacy-pixels') {
       const pixel = extractFromCanvasPixels(candidates, info.anchor);
       if (pixel.sample) {
         sample = pixel.sample;
       } else if (pixel.diagnostics && pixel.diagnostics.reason) {
         unresolvedReason = 'pixel probe: ' + pixel.diagnostics.reason;
       }
+    }
+
+    if (!sample && !unresolvedReason && mode !== 'matrix') {
+      unresolvedReason = 'labels unresolved: axis=' + axisVisible + ', face=' + faceVisible;
     }
 
     if (!sample || !sample.quat) {
@@ -1082,12 +1524,14 @@
     const q = quatNormalize(sample.quat);
     if (!q) return;
 
-    if (!observerQuat) {
-      observerQuat = q;
+    if (!observerRawQuat) {
+      observerRawQuat = q;
     } else {
       const blend = Math.max(0.01, Math.min(0.9, config.smoothing));
-      observerQuat = quatLerp(observerQuat, q, blend) || q;
+      observerRawQuat = quatLerp(observerRawQuat, q, blend) || q;
     }
+
+    observerQuat = applyFrameCalibration(observerRawQuat);
 
     observerStrategy = sample.strategy;
     observerConfidence = sample.confidence;
@@ -1144,6 +1588,11 @@
           <canvas id="usb-freed-preview" class="usb-freed-preview" width="248" height="156"></canvas>
         </div>
 
+        <div class="usb-freed-row">
+          <button id="usb-freed-cal-front" class="usb-freed-btn usb-freed-btn-sm">Set Current = Front</button>
+          <button id="usb-freed-cal-reset" class="usb-freed-btn usb-freed-btn-sm">Clear Align</button>
+        </div>
+
         <div id="usb-freed-watch-status" class="usb-freed-status">Searching widget...</div>
         <div id="usb-freed-watch-data" class="usb-freed-data">No orientation sample yet.</div>
         <div id="usb-freed-watch-note" class="usb-freed-hint">Upper-right view widget watcher is active.</div>
@@ -1156,6 +1605,8 @@
     fallbackBtn = panel.querySelector('#usb-freed-watch-fallback');
     smoothSlider = panel.querySelector('#usb-freed-watch-smooth');
     smoothVal = panel.querySelector('#usb-freed-watch-smooth-val');
+    calibrateBtn = panel.querySelector('#usb-freed-cal-front');
+    clearCalBtn = panel.querySelector('#usb-freed-cal-reset');
     previewCanvas = panel.querySelector('#usb-freed-preview');
     previewCtx = previewCanvas ? previewCanvas.getContext('2d') : null;
     statusEl = panel.querySelector('#usb-freed-watch-status');
@@ -1168,6 +1619,7 @@
     toggleBtn.addEventListener('click', () => {
       config.watcherEnabled = !config.watcherEnabled;
       if (!config.watcherEnabled) {
+        observerRawQuat = null;
         observerQuat = null;
         observerConfidence = 0;
         observerStrategy = 'disabled';
@@ -1177,7 +1629,10 @@
     });
 
     fallbackBtn.addEventListener('click', () => {
-      config.fallbackMode = config.fallbackMode === 'auto' ? 'matrix' : 'auto';
+      const mode = normalizeFallbackMode(config.fallbackMode);
+      if (mode === 'labels') config.fallbackMode = 'matrix';
+      else if (mode === 'matrix') config.fallbackMode = 'legacy-pixels';
+      else config.fallbackMode = 'labels';
       saveConfig();
       updatePanel();
     });
@@ -1186,6 +1641,17 @@
       config.smoothing = parseInt(smoothSlider.value, 10) / 100;
       smoothVal.textContent = Math.round(config.smoothing * 100) + '%';
       saveConfig();
+    });
+
+    calibrateBtn.addEventListener('click', () => {
+      if (calibrateCurrentAsFront()) {
+        updatePanel();
+      }
+    });
+
+    clearCalBtn.addEventListener('click', () => {
+      clearCalibration();
+      updatePanel();
     });
 
     minimizeBtn.addEventListener('click', () => {
@@ -1204,7 +1670,9 @@
 
     toggleBtn.textContent = config.watcherEnabled ? 'Watcher ON' : 'Watcher OFF';
     toggleBtn.classList.toggle('usb-freed-btn-active', config.watcherEnabled);
-    fallbackBtn.textContent = config.fallbackMode === 'auto' ? 'Fallback: Auto' : 'Fallback: Matrix';
+    fallbackBtn.textContent = fallbackModeLabel(config.fallbackMode);
+    const calOn = calibrationEnabled();
+    clearCalBtn.classList.toggle('usb-freed-btn-active', calOn);
 
     const nowMs = performance.now();
     if (!config.watcherEnabled) {
@@ -1212,6 +1680,8 @@
       statusEl.style.color = '#f9c97a';
       dataEl.textContent = 'No orientation sample yet.';
       noteEl.textContent = 'Enable watcher to resume sampling.';
+      calibrateBtn.disabled = true;
+      clearCalBtn.disabled = !calOn;
       drawOrientationPreview(null, true);
       return;
     }
@@ -1222,8 +1692,11 @@
     if (!observerQuat || stale) {
       statusEl.textContent = 'Searching for view widget...';
       statusEl.style.color = '#f9c97a';
+      calibrateBtn.disabled = true;
+      clearCalBtn.disabled = !calOn;
       dataEl.textContent =
         'Strategy: ' + observerStrategy + '\n' +
+        'Align: ' + (calOn ? 'ON' : 'OFF') + '\n' +
         'Confidence: ' + Math.round(observerConfidence * 100) + '%\n' +
         'Yaw/Pitch/Roll: -- / -- / --\n' +
         'Quat: --';
@@ -1237,11 +1710,15 @@
     const pitchDeg = e.pitch * 180 / Math.PI;
     const rollDeg = e.roll * 180 / Math.PI;
 
+    calibrateBtn.disabled = false;
+    clearCalBtn.disabled = !calOn;
+
     statusEl.textContent = 'Widget tracked (' + observerStrategy + ')';
     statusEl.style.color = observerConfidence >= 0.75 ? '#4ade80' : '#f9c97a';
 
     dataEl.textContent =
       'Strategy: ' + observerStrategy + '\n' +
+      'Align: ' + (calOn ? 'ON' : 'OFF') + '\n' +
       'Confidence: ' + Math.round(observerConfidence * 100) + '%\n' +
       'Yaw/Pitch/Roll: ' +
       yawDeg.toFixed(1) + ' / ' + pitchDeg.toFixed(1) + ' / ' + rollDeg.toFixed(1) + ' deg\n' +
@@ -1256,28 +1733,50 @@
   }
 
   function tick() {
-    const nowMs = performance.now();
-    scanWidgetOrientation(nowMs);
-    updatePanel();
+    try {
+      const nowMs = performance.now();
+      scanWidgetOrientation(nowMs);
+      updatePanel();
+    } catch (err) {
+      observerStrategy = 'error';
+      observerConfidence = 0;
+      observerDebug = 'runtime error: ' + String(err && err.message ? err.message : err);
+      setLastError('tick', err, null);
+      console.error('[USB_freeD] tick error (' + BUILD_TAG + ')', err);
+      try {
+        updatePanel();
+      } catch (_) {
+        // keep timer alive even if panel update also fails
+      }
+    }
   }
 
   function init() {
+    installGlobalErrorHooks();
     createPanel();
     window.usbFreeDWidgetWatcher = {
+      buildTag: BUILD_TAG,
       getState: () => ({
+        buildTag: BUILD_TAG,
         strategy: observerStrategy,
         confidence: observerConfidence,
         stale: observerIsStale(),
         lastUpdateMs: observerLastUpdateMs,
+        rawQuat: observerRawQuat,
         quat: observerQuat,
+        calibration: getCalibrationQuat(),
+        lastError: observerLastError,
       }),
       dumpCandidates: () => debugDumpCandidates(),
       dumpNeighborhood: () => debugDumpNeighborhood(),
+      dumpLabels: () => debugDumpLabels(),
       dumpPixelProbe: () => debugDumpPixelProbe(),
+      calibrateCurrentAsFront: () => calibrateCurrentAsFront(),
+      clearCalibration: () => clearCalibration(),
     };
     window.setInterval(tick, 80);
     tick();
-    console.log('[USB_freeD] Widget watcher loaded on', window.location.hostname);
+    console.log('[USB_freeD] Widget watcher loaded (' + BUILD_TAG + ') on', window.location.hostname);
   }
 
   if (document.readyState === 'loading') {

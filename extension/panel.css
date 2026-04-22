@@ -68,6 +68,11 @@
   background: #585b70;
 }
 
+.usb-freed-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .usb-freed-btn-connect {
   background: #89b4fa;
   color: #1e1e2e;
