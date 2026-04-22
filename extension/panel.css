@@ -224,3 +224,41 @@
   margin-bottom: 6px;
   padding: 0 2px;
 }
+
+.usb-freed-preview-wrap {
+  margin: 4px 0 6px;
+  padding: 0;
+}
+
+.usb-freed-preview {
+  width: 100%;
+  height: 156px;
+  display: block;
+  border-radius: 6px;
+  border: 1px solid #313244;
+  background: #0f1220;
+}
+
+/* ===== Observer diagnostics ===== */
+
+.usb-freed-meta {
+  background: #11111b;
+  border: 1px solid #313244;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.25;
+  color: #a6adc8;
+  padding: 4px 6px;
+  margin-bottom: 4px;
+  word-break: break-word;
+}
+
+.usb-freed-meta-good {
+  border-color: #3b7f54;
+  color: #a6e3a1;
+}
+
+.usb-freed-meta-warn {
+  border-color: #8f6a33;
+  color: #f9c97a;
+}

@@ -9,6 +9,7 @@
 #include <esp_now.h>
 #include <USB.h>
 #include <USBHID.h>
+#include <freertos/FreeRTOS.h>
 #include "espnow_packet.h"
 
 // =================== HID REPORT DESCRIPTOR ===================
@@ -77,10 +78,14 @@ public:
 };
 
 // =================== CONFIG ===================
-static const float ROT_SCALE    = 30000.0f; // angular vel → SpaceMouse units (tuned for 100Hz deltas)
-static const float DEADZONE_RAD = 0.001f;   // ~0.06° deadzone
-static const float SMOOTH_ALPHA = 0.4f;     // EMA smoothing (0.0=sluggish, 1.0=raw/noisy)
-static const unsigned long IDLE_TIMEOUT_MS = 80;  // zero-out after no data
+static const float ABS_ROT_SCALE = 8000.0f;  // error (rad) → SpaceMouse units; saturates at 350 (≈4° error),
+                                              // then proportional. Higher = faster slew, larger deadband.
+static const float DEADZONE_RAD  = 0.005f;  // error magnitude (rad) below which no correction is sent (~0.3°)
+static const float SMOOTH_ALPHA  = 0.75f;   // EMA on error velocity (higher = more responsive, less smooth)
+static const unsigned long IDLE_TIMEOUT_MS = 80;  // zero-out HID after no packets
+static const float INVERT_ROLL  = -1.0f;   // set to -1.0f to invert roll  (Rx)
+static const float INVERT_PITCH =  1.0f;   // set to -1.0f to invert pitch (Ry / Onshape X)
+static const float INVERT_YAW   = -1.0f;   // set to -1.0f to invert yaw   (Rz / Onshape Z)
 
 // RGB LED heartbeat (Arduino Nano ESP32 built-in NeoPixel on GPIO48)
 static const uint8_t RGB_LED_PIN = 48;
@@ -92,17 +97,36 @@ SpaceMouseHID smDevice;
 // Heartbeat state
 unsigned long lastHeartbeatMs = 0;
 
-// Quaternion state
-volatile float curQw = 1.0f, curQx = 0.0f, curQy = 0.0f, curQz = 0.0f;
-volatile uint8_t curFlags = 0;
-volatile bool newData = false;
+// Latest received sample (atomic handoff from ESP-NOW callback to main loop)
+struct RxSample {
+    float qw;
+    float qx;
+    float qy;
+    float qz;
+    uint8_t flags;
+    uint8_t seq;
+    unsigned long recvMs;
+};
+
+portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
+volatile RxSample latestSample = {1.0f, 0.0f, 0.0f, 0.0f, 0, 0, 0};
+volatile bool sampleReady = false;
 volatile unsigned long lastRecvTime = 0;
 
-float prevQw = 1.0f, prevQx = 0.0f, prevQy = 0.0f, prevQz = 0.0f;
-bool hasPrevious = false;
-bool motionActive = false;  // tracks whether we're sending non-zero
+// Sequence tracking (for packet loss/reorder diagnostics)
+bool hasLastSeq = false;
+uint8_t lastSeq = 0;
+uint32_t droppedPacketCount = 0;
+uint32_t outOfOrderPacketCount = 0;
 
-// Smoothed angular velocity (EMA filtered)
+// Home: device orientation at last tap (physical reference frame)
+float qHomeW = 1.0f, qHomeX = 0.0f, qHomeY = 0.0f, qHomeZ = 0.0f;
+// View: receiver's running estimate of Onshape's current orientation
+float qViewW = 1.0f, qViewX = 0.0f, qViewY = 0.0f, qViewZ = 0.0f;
+bool hasHome = false;
+bool motionActive = false;
+
+// Smoothed error angular velocity (EMA filtered)
 float smoothRx = 0.0f, smoothRy = 0.0f, smoothRz = 0.0f;
 
 // =================== QUATERNION MATH ===================
@@ -135,10 +159,56 @@ void deltaToAngVel(float dw, float dx, float dy, float dz,
 }
 
 int16_t toSM(float val) {
-    float v = val * ROT_SCALE;
+    float v = val * ABS_ROT_SCALE;
     if (v >  350.0f) v =  350.0f;
     if (v < -350.0f) v = -350.0f;
     return (int16_t)v;
+}
+
+// Normalize a quaternion in place
+void quatNorm(float& w, float& x, float& y, float& z) {
+    float n = sqrtf(w*w + x*x + y*y + z*z);
+    if (n > 1e-9f) { w /= n; x /= n; y /= n; z /= n; }
+}
+
+// Standard quaternion multiply: r = a * b
+void quatMul(float aw, float ax, float ay, float az,
+             float bw, float bx, float by, float bz,
+             float& rw, float& rx, float& ry, float& rz) {
+    rw = aw*bw - ax*bx - ay*by - az*bz;
+    rx = aw*bx + ax*bw + ay*bz - az*by;
+    ry = aw*by - ax*bz + ay*bw + az*bx;
+    rz = aw*bz + ax*by - ay*bx + az*bw;
+}
+
+// Convert angular velocity (rad/frame) to a step quaternion
+void angVelToQuat(float rx, float ry, float rz,
+                  float& dw, float& dx, float& dy, float& dz) {
+    float angle = sqrtf(rx*rx + ry*ry + rz*rz);
+    if (angle < 1e-9f) { dw = 1.0f; dx = dy = dz = 0.0f; return; }
+    float sinHalf = sinf(angle * 0.5f);
+    dw = cosf(angle * 0.5f);
+    dx = rx / angle * sinHalf;
+    dy = ry / angle * sinHalf;
+    dz = rz / angle * sinHalf;
+}
+
+bool popLatestSample(RxSample& out) {
+    bool hasData = false;
+    portENTER_CRITICAL(&rxMux);
+    if (sampleReady) {
+        out.qw = latestSample.qw;
+        out.qx = latestSample.qx;
+        out.qy = latestSample.qy;
+        out.qz = latestSample.qz;
+        out.flags = latestSample.flags;
+        out.seq = latestSample.seq;
+        out.recvMs = latestSample.recvMs;
+        sampleReady = false;
+        hasData = true;
+    }
+    portEXIT_CRITICAL(&rxMux);
+    return hasData;
 }
 
 // =================== HID SEND ===================
@@ -181,13 +251,19 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     if (len != sizeof(ImuEspNowPacket)) return;
 
     const ImuEspNowPacket* p = (const ImuEspNowPacket*)data;
-    curQw = p->qw;
-    curQx = p->qx;
-    curQy = p->qy;
-    curQz = p->qz;
-    curFlags = p->flags;
-    newData = true;
-    lastRecvTime = millis();
+    const unsigned long nowMs = millis();
+
+    portENTER_CRITICAL(&rxMux);
+    latestSample.qw = p->qw;
+    latestSample.qx = p->qx;
+    latestSample.qy = p->qy;
+    latestSample.qz = p->qz;
+    latestSample.flags = p->flags;
+    latestSample.seq = p->seq;
+    latestSample.recvMs = nowMs;
+    sampleReady = true;
+    lastRecvTime = nowMs;
+    portEXIT_CRITICAL(&rxMux);
 }
 
 // =================== SETUP ===================
@@ -230,61 +306,97 @@ void setup() {
 
 // =================== MAIN LOOP ===================
 void loop() {
-    if (newData) {
-        newData = false;
+    RxSample sample;
+    if (popLatestSample(sample)) {
+        // Snapshot latest received data
+        float qw = sample.qw, qx = sample.qx, qy = sample.qy, qz = sample.qz;
+        uint8_t flags = sample.flags;
+        uint8_t seq = sample.seq;
+        bool stalePacket = false;
 
-        // Snapshot volatile data
-        float qw = curQw, qx = curQx, qy = curQy, qz = curQz;
-        uint8_t flags = curFlags;
-
-        // Tap → reset home
-        if (flags & ENOW_FLAG_TAP) {
-            prevQw = qw; prevQx = qx; prevQy = qy; prevQz = qz;
-            hasPrevious = true;
-            sendZero();
-            motionActive = false;
-            return;
+        // Track dropped/reordered packets.
+        // int8 wrap behavior handles uint8 sequence rollover naturally.
+        if (hasLastSeq) {
+            uint8_t expected = (uint8_t)(lastSeq + 1);
+            int8_t delta = (int8_t)(seq - expected);
+            if (delta > 0) {
+                droppedPacketCount += (uint8_t)delta;
+            } else if (delta < 0) {
+                outOfOrderPacketCount++;
+                stalePacket = true;
+            }
         }
+        hasLastSeq = true;
+        lastSeq = seq;
 
-        if (!hasPrevious) {
-            prevQw = qw; prevQx = qx; prevQy = qy; prevQz = qz;
-            hasPrevious = true;
-            return;
-        }
+        if (!stalePacket) {
+            // Tap or first packet: sync physical home to current device orientation.
+            // Reset the estimated Onshape view to identity — user should have Onshape
+            // at the desired reference orientation before tapping.
+            if ((flags & ENOW_FLAG_TAP) || !hasHome) {
+                qHomeW = qw; qHomeX = qx; qHomeY = qy; qHomeZ = qz;
+                qViewW = 1.0f; qViewX = 0.0f; qViewY = 0.0f; qViewZ = 0.0f;
+                smoothRx = smoothRy = smoothRz = 0.0f;
+                hasHome = true;
+                sendZero();
+                motionActive = false;
+                return;
+            }
 
-        // Compute delta quaternion
-        float dw, dx, dy, dz;
-        quatDelta(qw, qx, qy, qz, prevQw, prevQx, prevQy, prevQz, dw, dx, dy, dz);
+        // Target: device orientation relative to home reference
+        // qTarget = qDevice * conj(qHome)
+        float twW, twX, twY, twZ;
+        quatDelta(qw, qx, qy, qz, qHomeW, qHomeX, qHomeY, qHomeZ, twW, twX, twY, twZ);
+        quatNorm(twW, twX, twY, twZ);
 
-        // Angular velocity
+        // Error: how much more Onshape needs to rotate to reach the target
+        // qError = qTarget * conj(qView)
+        float ewW, ewX, ewY, ewZ;
+        quatDelta(twW, twX, twY, twZ, qViewW, qViewX, qViewY, qViewZ, ewW, ewX, ewY, ewZ);
+        quatNorm(ewW, ewX, ewY, ewZ);
+
+        // Convert error quaternion to angular velocity (radians)
         float rx, ry, rz;
-        deltaToAngVel(dw, dx, dy, dz, rx, ry, rz);
+        deltaToAngVel(ewW, ewX, ewY, ewZ, rx, ry, rz);
 
-        // Deadzone
-        if (fabsf(rx) < DEADZONE_RAD) rx = 0;
-        if (fabsf(ry) < DEADZONE_RAD) ry = 0;
-        if (fabsf(rz) < DEADZONE_RAD) rz = 0;
+        // Magnitude deadzone
+        float angMag = sqrtf(rx*rx + ry*ry + rz*rz);
+        if (angMag < DEADZONE_RAD) {
+            rx = ry = rz = 0.0f;
+        }
 
-        // EMA smoothing to reduce jitter
+        // EMA smoothing
         smoothRx = SMOOTH_ALPHA * rx + (1.0f - SMOOTH_ALPHA) * smoothRx;
         smoothRy = SMOOTH_ALPHA * ry + (1.0f - SMOOTH_ALPHA) * smoothRy;
         smoothRz = SMOOTH_ALPHA * rz + (1.0f - SMOOTH_ALPHA) * smoothRz;
 
-        int16_t smRx = toSM(smoothRx);
-        int16_t smRy = toSM(smoothRy);
-        int16_t smRz = toSM(smoothRz);
+        // Apply axis inversions and quantize/clamp to the exact HID command we send.
+        int16_t smRx = toSM(INVERT_ROLL  * smoothRx);
+        int16_t smRy = toSM(INVERT_PITCH * smoothRy);
+        int16_t smRz = toSM(INVERT_YAW   * smoothRz);
 
-        if (smRx != 0 || smRy != 0 || smRz != 0) {
-            sendTranslation(0, 0, 0);
-            sendRotation(smRx, smRy, smRz);
-            motionActive = true;
-        } else if (motionActive) {
-            // Send one zero frame to stop motion
-            sendZero();
-            motionActive = false;
+        // Integrate qView from the exact command after clamp/quantization.
+        // Mapping back through INVERT_* keeps qView in the same physical frame as qTarget.
+        float cmdRx = INVERT_ROLL  * ((float)smRx / ABS_ROT_SCALE);
+        float cmdRy = INVERT_PITCH * ((float)smRy / ABS_ROT_SCALE);
+        float cmdRz = INVERT_YAW   * ((float)smRz / ABS_ROT_SCALE);
+
+        float stepW, stepX, stepY, stepZ;
+        angVelToQuat(cmdRx, cmdRy, cmdRz, stepW, stepX, stepY, stepZ);
+        float nVW, nVX, nVY, nVZ;
+        quatMul(stepW, stepX, stepY, stepZ, qViewW, qViewX, qViewY, qViewZ, nVW, nVX, nVY, nVZ);
+        qViewW = nVW; qViewX = nVX; qViewY = nVY; qViewZ = nVZ;
+        quatNorm(qViewW, qViewX, qViewY, qViewZ);
+
+            if (smRx != 0 || smRy != 0 || smRz != 0) {
+                sendTranslation(0, 0, 0);
+                sendRotation(smRx, smRy, smRz);
+                motionActive = true;
+            } else if (motionActive) {
+                sendZero();
+                motionActive = false;
+            }
         }
-
-        prevQw = qw; prevQx = qx; prevQy = qy; prevQz = qz;
     }
 
     // If no data for IDLE_TIMEOUT_MS, send zero to stop any drift
