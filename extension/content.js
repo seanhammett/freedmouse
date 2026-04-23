@@ -8,7 +8,16 @@
   const STORAGE_KEY = 'usbFreeDWidgetWatcherConfig';
   const SCAN_INTERVAL_MS = 220;
   const STALE_MS = 1600;
-  const BUILD_TAG = 'watcher-2026-04-22-safe-3';
+  const BUILD_TAG = 'watcher-2026-04-23-webgl-primary';
+  const WEBGL_ORTHO_ERR_MAX = 0.3;
+  const WEBGL_CHANGE_EPS = 0.00055;
+  const WEBGL_CANDIDATE_TTL_MS = 2600;
+  const WEBGL_HOLD_MAX_MS = 300000;
+  const WEBGL_LOCK_RECHECK_MS = 900;
+  const WEBGL_MIN_CALLS = 24;
+  const WEBGL_MIN_CHANGES = 6;
+  const WEBGL_SWITCH_MARGIN = 220;
+  const WEBGL_SWITCH_RATIO = 1.28;
 
   let config = loadConfig();
 
@@ -19,6 +28,7 @@
   let observerDebug = 'idle';
   let observerLastUpdateMs = 0;
   let observerLastScanMs = 0;
+  let observerLastPublishMs = 0;
   let observerLastError = null;
 
   let panel = null;
@@ -27,12 +37,47 @@
   let noteEl = null;
   let toggleBtn = null;
   let fallbackBtn = null;
+  let sourceSelect = null;
+  let conventionSelect = null;
   let smoothSlider = null;
   let smoothVal = null;
   let calibrateBtn = null;
   let clearCalBtn = null;
   let previewCanvas = null;
   let previewCtx = null;
+  let sourceOptionsSignature = '';
+
+  const webglState = {
+    hooksInstalled: false,
+    gl1Proto: null,
+    gl2Proto: null,
+    gl1Orig: null,
+    gl2Orig: null,
+    gl1GetUniformOrig: null,
+    gl2GetUniformOrig: null,
+    glIds: new WeakMap(),
+    locIds: new WeakMap(),
+    locMeta: new WeakMap(),
+    programIds: new WeakMap(),
+    nextGlId: 1,
+    nextLocId: 1,
+    nextProgramId: 1,
+    candidates: new Map(),
+    lockedId: null,
+    lockLastCheckedMs: 0,
+    convention: null,
+  };
+
+  function sanitizePreferredWebglSource(pref) {
+    if (!pref || typeof pref !== 'object') return null;
+    const uniformName = typeof pref.uniformName === 'string' ? pref.uniformName.trim() : '';
+    const locHint = typeof pref.locHint === 'string' ? pref.locHint.trim() : '';
+    if (!uniformName && !locHint) return null;
+    return {
+      uniformName: uniformName || null,
+      locHint: locHint || null,
+    };
+  }
 
   function setLastError(kind, err, extra) {
     const msg = String(err && err.message ? err.message : err);
@@ -68,9 +113,11 @@
   function defaultConfig() {
     return {
       watcherEnabled: true,
-      fallbackMode: 'labels',
+      fallbackMode: 'auto',
+      webglConvention: 'auto',
       smoothing: 0.3,
       frameCalibration: null,
+      preferredWebglSource: null,
     };
   }
 
@@ -80,6 +127,8 @@
       if (raw) {
         const cfg = { ...defaultConfig(), ...JSON.parse(raw) };
         cfg.fallbackMode = normalizeFallbackMode(cfg.fallbackMode);
+        cfg.webglConvention = normalizeWebglConvention(cfg.webglConvention);
+        cfg.preferredWebglSource = sanitizePreferredWebglSource(cfg.preferredWebglSource);
         return cfg;
       }
     } catch (e) {
@@ -272,23 +321,52 @@
     const m = quatToMatrix3(q);
     const scale = Math.min(w, h) * 0.82;
     const distance = 3.2;
+    // Onshape view data and this canvas preview can disagree on handedness.
+    // Flip Z in render space so cube depth matches the widget's convex orientation.
+    const toRenderFrame = (v) => [v[0], v[1], -v[2]];
 
+    // Corner-anchored cube: vertex 0 is at origin and edges extend along +X/+Y/+Z.
+    const cubeSize = 1.16;
     const cubeVerts = [
-      [-0.58, -0.58, -0.58], [0.58, -0.58, -0.58], [0.58, 0.58, -0.58], [-0.58, 0.58, -0.58],
-      [-0.58, -0.58, 0.58], [0.58, -0.58, 0.58], [0.58, 0.58, 0.58], [-0.58, 0.58, 0.58],
+      [0, 0, 0], [cubeSize, 0, 0], [cubeSize, cubeSize, 0], [0, cubeSize, 0],
+      [0, 0, cubeSize], [cubeSize, 0, cubeSize], [cubeSize, cubeSize, cubeSize], [0, cubeSize, cubeSize],
     ];
-    const rotated = cubeVerts.map((v) => rotateWithMatrix(m, v));
+    const rotated = cubeVerts.map((v) => toRenderFrame(rotateWithMatrix(m, v)));
     const proj = rotated.map((v) => projectPoint3(v, w, h, scale, distance));
 
-    const faces = [
+    const baseFaces = [
       { idx: [0, 1, 2, 3], color: 'rgba(126, 142, 183, 0.18)' },
       { idx: [4, 5, 6, 7], color: 'rgba(166, 192, 233, 0.17)' },
       { idx: [0, 1, 5, 4], color: 'rgba(141, 155, 197, 0.14)' },
       { idx: [1, 2, 6, 5], color: 'rgba(123, 138, 177, 0.12)' },
       { idx: [2, 3, 7, 6], color: 'rgba(150, 166, 207, 0.12)' },
       { idx: [3, 0, 4, 7], color: 'rgba(135, 151, 195, 0.12)' },
-    ].map((f) => ({ ...f, depth: f.idx.reduce((s, i) => s + rotated[i][2], 0) / f.idx.length }))
-      .sort((a, b) => a.depth - b.depth);
+    ];
+
+    const cubeCenter = rotated.reduce((acc, v) => [acc[0] + v[0], acc[1] + v[1], acc[2] + v[2]], [0, 0, 0]).map((v) => v / rotated.length);
+    const cameraPos = [0, 0, -distance];
+
+    const faces = baseFaces.map((f) => {
+      const a = rotated[f.idx[0]];
+      const b = rotated[f.idx[1]];
+      const c = rotated[f.idx[2]];
+      const center = f.idx.reduce((acc, i) => [acc[0] + rotated[i][0], acc[1] + rotated[i][1], acc[2] + rotated[i][2]], [0, 0, 0]).map((v) => v / f.idx.length);
+
+      let normal = vecCross(vecSub(b, a), vecSub(c, a));
+      const outward = vecSub(center, cubeCenter);
+      if (vecDot(normal, outward) < 0) {
+        normal = vecScale(normal, -1);
+      }
+
+      const toCamera = vecSub(cameraPos, center);
+      const visible = vecDot(normal, toCamera) > 0;
+
+      return {
+        ...f,
+        visible,
+        depth: f.idx.reduce((s, i) => s + rotated[i][2], 0) / f.idx.length,
+      };
+    }).sort((a, b) => b.depth - a.depth);
 
     for (const f of faces) {
       ctx.beginPath();
@@ -308,10 +386,27 @@
       [4, 5], [5, 6], [6, 7], [7, 4],
       [0, 4], [1, 5], [2, 6], [3, 7],
     ];
+
+    const edgeToFaces = new Map();
+    const edgeKey = (a, b) => (a < b ? a + '-' + b : b + '-' + a);
+    for (const f of faces) {
+      for (let i = 0; i < f.idx.length; i++) {
+        const a = f.idx[i];
+        const b = f.idx[(i + 1) % f.idx.length];
+        const key = edgeKey(a, b);
+        if (!edgeToFaces.has(key)) edgeToFaces.set(key, []);
+        edgeToFaces.get(key).push(f.visible);
+      }
+    }
+
     const edgeAlpha = isStale ? 0.45 : 0.8;
-    ctx.strokeStyle = 'rgba(223, 232, 255, ' + edgeAlpha + ')';
-    ctx.lineWidth = 1.35;
+    const hiddenAlpha = isStale ? 0.16 : 0.24;
     for (const [a, b] of edgePairs) {
+      const adjacent = edgeToFaces.get(edgeKey(a, b)) || [];
+      const isVisibleEdge = adjacent.some(Boolean);
+      const alpha = isVisibleEdge ? edgeAlpha : hiddenAlpha;
+      ctx.strokeStyle = 'rgba(223, 232, 255, ' + alpha + ')';
+      ctx.lineWidth = isVisibleEdge ? 1.35 : 1.05;
       ctx.beginPath();
       ctx.moveTo(proj[a].x, proj[a].y);
       ctx.lineTo(proj[b].x, proj[b].y);
@@ -319,10 +414,10 @@
     }
 
     const axisLen = 1.45;
-    const o = projectPoint3([0, 0, 0], w, h, scale, distance);
-    const xAxis = projectPoint3(rotateWithMatrix(m, [axisLen, 0, 0]), w, h, scale, distance);
-    const yAxis = projectPoint3(rotateWithMatrix(m, [0, axisLen, 0]), w, h, scale, distance);
-    const zAxis = projectPoint3(rotateWithMatrix(m, [0, 0, axisLen]), w, h, scale, distance);
+    const o = projectPoint3(toRenderFrame([0, 0, 0]), w, h, scale, distance);
+    const xAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [axisLen, 0, 0])), w, h, scale, distance);
+    const yAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [0, axisLen, 0])), w, h, scale, distance);
+    const zAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [0, 0, axisLen])), w, h, scale, distance);
 
     const drawAxis = (p, color, label) => {
       ctx.strokeStyle = color;
@@ -483,20 +578,580 @@
     return basisColumnsToQuat(xCol, yCol, zCol);
   }
 
+  function rectContains(outer, inner) {
+    return inner.left >= outer.left && inner.right <= outer.right && inner.top >= outer.top && inner.bottom <= outer.bottom;
+  }
+
+  function getWebglId(gl) {
+    let id = webglState.glIds.get(gl);
+    if (!id) {
+      id = 'gl_' + (webglState.nextGlId++).toString(36);
+      webglState.glIds.set(gl, id);
+    }
+    return id;
+  }
+
+  function getWebglLocationId(loc) {
+    let id = webglState.locIds.get(loc);
+    if (!id) {
+      id = 'u_' + (webglState.nextLocId++).toString(36);
+      webglState.locIds.set(loc, id);
+    }
+    return id;
+  }
+
+  function getWebglProgramId(program) {
+    let id = webglState.programIds.get(program);
+    if (!id) {
+      id = 'p_' + (webglState.nextProgramId++).toString(36);
+      webglState.programIds.set(program, id);
+    }
+    return id;
+  }
+
+  function preferredMatchesCandidate(candidate, preferred = config.preferredWebglSource) {
+    if (!candidate || !preferred) return false;
+    if (preferred.uniformName && candidate.uniformName === preferred.uniformName) return true;
+    if (preferred.locHint && candidate.locId === preferred.locHint) return true;
+    return false;
+  }
+
+  function pinPreferredWebglSource(sourceId) {
+    const id = sourceId || webglState.lockedId;
+    if (!id) return null;
+    const c = webglState.candidates.get(id);
+    if (!c) return null;
+
+    const pref = sanitizePreferredWebglSource({
+      uniformName: c.uniformName || '',
+      locHint: c.locId || '',
+    });
+    if (!pref) return null;
+
+    config.preferredWebglSource = pref;
+    saveConfig();
+    return pref;
+  }
+
+  function clearPreferredWebglSource() {
+    config.preferredWebglSource = null;
+    saveConfig();
+  }
+
+  function matrixDelta16(a, b) {
+    let sum = 0;
+    for (let i = 0; i < 16; i++) sum += Math.abs(a[i] - b[i]);
+    return sum;
+  }
+
+  function matrixOrthoError16(m) {
+    const x = [m[0], m[1], m[2]];
+    const y = [m[4], m[5], m[6]];
+    const z = [m[8], m[9], m[10]];
+    return (
+      Math.abs(vecLen(x) - 1) +
+      Math.abs(vecLen(y) - 1) +
+      Math.abs(vecLen(z) - 1) +
+      Math.abs(vecDot(x, y)) +
+      Math.abs(vecDot(x, z)) +
+      Math.abs(vecDot(y, z))
+    );
+  }
+
+  function matrix16ToQuat(m) {
+    return basisColumnsToQuat(
+      [m[0], m[1], m[2]],
+      [m[4], m[5], m[6]],
+      [m[8], m[9], m[10]],
+    );
+  }
+
+  function candidateContinuityWithObserver(candidate) {
+    if (!candidate || !candidate.lastMatrix || !observerRawQuat) return 0.5;
+
+    const raw = matrix16ToQuat(candidate.lastMatrix);
+    if (!raw) return 0;
+
+    const forced = config.webglConvention === 'raw' || config.webglConvention === 'inverse'
+      ? config.webglConvention
+      : 'auto';
+
+    if (forced === 'raw') {
+      return Math.abs(quatDot(raw, observerRawQuat));
+    }
+
+    const inv = quatConjugate(raw);
+    if (forced === 'inverse') {
+      return inv ? Math.abs(quatDot(inv, observerRawQuat)) : 0;
+    }
+
+    const rawDot = Math.abs(quatDot(raw, observerRawQuat));
+    const invDot = inv ? Math.abs(quatDot(inv, observerRawQuat)) : 0;
+    return Math.max(rawDot, invDot);
+  }
+
+  function shouldSwitchWebglLock(current, challenger, anchor, nowMs) {
+    if (!challenger) return false;
+    if (!current) return true;
+    if (current.id === challenger.id) return false;
+
+    const currentAge = nowMs - current.lastSeenMs;
+    if (currentAge > WEBGL_CANDIDATE_TTL_MS * 2) return true;
+
+    const currentScore = scoreWebglCandidate(current, anchor);
+    const challengerScore = scoreWebglCandidate(challenger, anchor);
+
+    if (!Number.isFinite(currentScore)) return true;
+    if (!Number.isFinite(challengerScore)) return false;
+
+    if (challengerScore <= currentScore + WEBGL_SWITCH_MARGIN) return false;
+    if (challengerScore <= currentScore * WEBGL_SWITCH_RATIO) return false;
+
+    if (observerRawQuat) {
+      const currentContinuity = candidateContinuityWithObserver(current);
+      const challengerContinuity = candidateContinuityWithObserver(challenger);
+      if (challengerContinuity + 0.06 < currentContinuity) return false;
+    }
+
+    return true;
+  }
+
+  function pruneWebglCandidates(nowMs) {
+    for (const [id, c] of webglState.candidates.entries()) {
+      const ageMs = nowMs - c.lastSeenMs;
+      const isLocked = id === webglState.lockedId;
+      const maxAge = isLocked ? WEBGL_HOLD_MAX_MS : (WEBGL_CANDIDATE_TTL_MS * 3);
+      if (ageMs > maxAge) {
+        webglState.candidates.delete(id);
+      }
+    }
+    if (webglState.lockedId && !webglState.candidates.has(webglState.lockedId)) {
+      webglState.lockedId = null;
+      webglState.convention = null;
+    }
+  }
+
+  function scoreWebglCandidate(c, anchor) {
+    const nowMs = performance.now();
+    const ageMs = nowMs - c.lastSeenMs;
+    if (ageMs > WEBGL_CANDIDATE_TTL_MS) return -Infinity;
+    if (c.calls < WEBGL_MIN_CALLS || c.changes < WEBGL_MIN_CHANGES) return -Infinity;
+
+    let score = c.changes * 1.2 + c.calls * 0.02;
+    score -= c.avgErr * 240;
+    score -= ageMs * 0.04;
+
+    if (anchor && c.canvasRect) {
+      const anchorRect = anchor.getBoundingClientRect();
+      if (rectContains(c.canvasRect, anchorRect)) score += 120;
+      else if (rectIntersects(c.canvasRect, anchorRect)) score += 35;
+    }
+
+    const changeAge = nowMs - c.lastChangeMs;
+    if (changeAge < 500) score += 16;
+
+    if (observerRawQuat) {
+      const continuity = candidateContinuityWithObserver(c);
+      score += continuity * 145;
+      if (continuity < 0.35) score -= 180;
+    }
+
+    if (preferredMatchesCandidate(c)) {
+      if (config.preferredWebglSource && config.preferredWebglSource.uniformName && c.uniformName === config.preferredWebglSource.uniformName) {
+        score += 1800;
+      } else {
+        score += 1100;
+      }
+    }
+
+    return score;
+  }
+
+  function chooseBestWebglCandidate(anchor) {
+    let best = null;
+    for (const c of webglState.candidates.values()) {
+      const score = scoreWebglCandidate(c, anchor);
+      if (!Number.isFinite(score)) continue;
+      if (!best || score > best.score) best = { score, candidate: c };
+    }
+    return best ? best.candidate : null;
+  }
+
+  function applyWebglConvention(rawQuat) {
+    if (!rawQuat) return null;
+    const forced = normalizeWebglConvention(config.webglConvention);
+    if (forced === 'raw') {
+      webglState.convention = 'raw';
+      return rawQuat;
+    }
+    if (forced === 'inverse') {
+      webglState.convention = 'inverse';
+      return quatConjugate(rawQuat);
+    }
+
+    if (!webglState.convention) {
+      if (observerRawQuat) {
+        const inv = quatConjugate(rawQuat);
+        const rawDot = Math.abs(quatDot(rawQuat, observerRawQuat));
+        const invDot = inv ? Math.abs(quatDot(inv, observerRawQuat)) : -1;
+        webglState.convention = invDot > rawDot ? 'inverse' : 'raw';
+      } else {
+        webglState.convention = 'raw';
+      }
+    }
+    if (webglState.convention === 'inverse') {
+      return quatConjugate(rawQuat);
+    }
+    return rawQuat;
+  }
+
+  function recordWebglMatrix(gl, location, value) {
+    if (!gl || !location || (typeof location !== 'object' && typeof location !== 'function')) return;
+    if (!value || typeof value.length !== 'number' || value.length !== 16) return;
+
+    const m = new Array(16);
+    for (let i = 0; i < 16; i++) {
+      const v = Number(value[i]);
+      if (!Number.isFinite(v)) return;
+      m[i] = v;
+    }
+
+    const err = matrixOrthoError16(m);
+    if (!Number.isFinite(err) || err > WEBGL_ORTHO_ERR_MAX) return;
+
+    const glId = getWebglId(gl);
+    const locId = getWebglLocationId(location);
+    const id = glId + ':' + locId;
+    const nowMs = performance.now();
+    const meta = webglState.locMeta.get(location) || null;
+
+    let canvasRect = null;
+    try {
+      if (gl && gl.canvas && gl.canvas.getBoundingClientRect) {
+        const r = gl.canvas.getBoundingClientRect();
+        canvasRect = {
+          left: r.left,
+          top: r.top,
+          right: r.right,
+          bottom: r.bottom,
+          width: r.width,
+          height: r.height,
+        };
+      }
+    } catch (e) {
+      // ignore canvas rect failures
+    }
+
+    let c = webglState.candidates.get(id);
+    if (!c) {
+      c = {
+        id,
+        glId,
+        locId,
+        programId: meta && meta.programId ? meta.programId : null,
+        uniformName: meta && meta.uniformName ? meta.uniformName : null,
+        calls: 0,
+        changes: 0,
+        errSum: 0,
+        avgErr: 0,
+        firstSeenMs: nowMs,
+        lastSeenMs: nowMs,
+        lastChangeMs: nowMs,
+        lastMatrix: null,
+        canvasRect,
+      };
+      webglState.candidates.set(id, c);
+    }
+
+    if (meta) {
+      if (meta.programId) c.programId = meta.programId;
+      if (meta.uniformName) c.uniformName = meta.uniformName;
+    }
+
+    c.calls += 1;
+    c.errSum += err;
+    c.avgErr = c.errSum / c.calls;
+    c.lastSeenMs = nowMs;
+    if (canvasRect) c.canvasRect = canvasRect;
+
+    if (c.lastMatrix && matrixDelta16(c.lastMatrix, m) > WEBGL_CHANGE_EPS) {
+      c.changes += 1;
+      c.lastChangeMs = nowMs;
+    }
+    c.lastMatrix = m;
+  }
+
+  function installWebglHooks() {
+    if (webglState.hooksInstalled) return;
+
+    const gl1Proto = window.WebGLRenderingContext && window.WebGLRenderingContext.prototype;
+    const gl2Proto = window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype;
+    const gl1Orig = gl1Proto && gl1Proto.uniformMatrix4fv;
+    const gl2Orig = gl2Proto && gl2Proto.uniformMatrix4fv;
+    const gl1GetUniformOrig = gl1Proto && gl1Proto.getUniformLocation;
+    const gl2GetUniformOrig = gl2Proto && gl2Proto.getUniformLocation;
+
+    const wrap = (orig) => function wrappedUniformMatrix4fv(location, transpose, value) {
+      try {
+        recordWebglMatrix(this, location, value);
+      } catch (e) {
+        setLastError('webgl.record', e, null);
+      }
+      return orig.apply(this, arguments);
+    };
+
+    const wrapGetUniformLocation = (orig) => function wrappedGetUniformLocation(program, name) {
+      const loc = orig.apply(this, arguments);
+      try {
+        if (loc && (typeof loc === 'object' || typeof loc === 'function')) {
+          const programId = program ? getWebglProgramId(program) : null;
+          const uniformName = typeof name === 'string' ? name : null;
+          webglState.locMeta.set(loc, {
+            programId,
+            uniformName,
+          });
+        }
+      } catch (e) {
+        setLastError('webgl.uniform-meta', e, null);
+      }
+      return loc;
+    };
+
+    if (gl1Proto && typeof gl1Orig === 'function') {
+      gl1Proto.uniformMatrix4fv = wrap(gl1Orig);
+      webglState.gl1Proto = gl1Proto;
+      webglState.gl1Orig = gl1Orig;
+    }
+    if (gl2Proto && typeof gl2Orig === 'function') {
+      gl2Proto.uniformMatrix4fv = wrap(gl2Orig);
+      webglState.gl2Proto = gl2Proto;
+      webglState.gl2Orig = gl2Orig;
+    }
+
+    if (gl1Proto && typeof gl1GetUniformOrig === 'function') {
+      gl1Proto.getUniformLocation = wrapGetUniformLocation(gl1GetUniformOrig);
+      webglState.gl1GetUniformOrig = gl1GetUniformOrig;
+    }
+
+    if (gl2Proto && typeof gl2GetUniformOrig === 'function') {
+      gl2Proto.getUniformLocation = wrapGetUniformLocation(gl2GetUniformOrig);
+      webglState.gl2GetUniformOrig = gl2GetUniformOrig;
+    }
+
+    webglState.hooksInstalled = true;
+  }
+
+  function extractFromWebglUniform(anchor, nowMs) {
+    installWebglHooks();
+    pruneWebglCandidates(nowMs);
+
+    const relockNeeded = !webglState.lockedId || (nowMs - webglState.lockLastCheckedMs) > WEBGL_LOCK_RECHECK_MS;
+    if (relockNeeded) {
+      webglState.lockLastCheckedMs = nowMs;
+
+      let preferred = null;
+      if (config.preferredWebglSource) {
+        for (const c of webglState.candidates.values()) {
+          if (!c.lastMatrix) continue;
+          if (!preferredMatchesCandidate(c)) continue;
+          const ageMs = nowMs - c.lastSeenMs;
+          if (ageMs > WEBGL_CANDIDATE_TTL_MS * 2) continue;
+          if (c.calls < 6) continue;
+          if (!preferred || c.calls > preferred.calls) preferred = c;
+        }
+      }
+
+      const target = preferred || chooseBestWebglCandidate(anchor);
+      const current = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
+      if (shouldSwitchWebglLock(current, target, anchor, nowMs)) {
+        webglState.lockedId = target.id;
+        webglState.convention = null;
+      }
+    }
+
+    const locked = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
+    if (!locked || !locked.lastMatrix) return null;
+    const ageMs = nowMs - locked.lastSeenMs;
+    if (ageMs > WEBGL_HOLD_MAX_MS) return null;
+
+    const rawQuat = matrix16ToQuat(locked.lastMatrix);
+    if (!rawQuat) return null;
+    const quat = applyWebglConvention(rawQuat);
+    if (!quat) return null;
+
+    const activity = Math.min(1, locked.changes / Math.max(1, locked.calls * 0.25));
+    const freshness = Math.max(0, 1 - (ageMs / WEBGL_CANDIDATE_TTL_MS));
+    const orthoScore = Math.max(0, 1 - (locked.avgErr / WEBGL_ORTHO_ERR_MAX));
+    const confidence = ageMs <= WEBGL_CANDIDATE_TTL_MS
+      ? Math.max(0.62, Math.min(0.99, 0.62 + activity * 0.18 + freshness * 0.12 + orthoScore * 0.06))
+      : Math.max(0.56, Math.min(0.72, 0.56 + orthoScore * 0.12));
+
+    const isHeld = ageMs > WEBGL_CANDIDATE_TTL_MS;
+
+    return {
+      quat,
+      confidence,
+      strategy: isHeld ? 'webgl-uniform-matrix4fv-hold' : 'webgl-uniform-matrix4fv',
+      debug: isHeld
+        ? 'holding last WebGL orientation from ' + locked.id + ' (' + Math.round(ageMs) + 'ms idle)'
+        : 'orientation from WebGL uniform ' + locked.id + ' (' + webglState.convention + ')',
+    };
+  }
+
+  function debugDumpWebglSources() {
+    const nowMs = performance.now();
+    const anchor = findWidgetAnchor();
+    const items = listWebglSourceItems(anchor, nowMs).map((c) => ({
+      id: c.id,
+      uniformName: c.uniformName || '',
+      programId: c.programId || '',
+      preferredMatch: preferredMatchesCandidate(c),
+      score: c.score,
+      continuity: c.continuity,
+      calls: c.calls,
+      changes: c.changes,
+      avgErr: Math.round(c.avgErr * 100000) / 100000,
+      ageMs: c.ageMs,
+      changeAgeMs: c.changeAgeMs,
+      locked: c.id === webglState.lockedId,
+      hasMatrix: !!c.lastMatrix,
+    }));
+
+    return {
+      hooked: webglState.hooksInstalled,
+      lockedId: webglState.lockedId,
+      convention: webglState.convention,
+      preferred: config.preferredWebglSource,
+      count: items.length,
+      items: items.slice(0, 40),
+    };
+  }
+
+  function listWebglSourceItems(anchor = null, nowMs = performance.now()) {
+    pruneWebglCandidates(nowMs);
+    const refAnchor = anchor || findWidgetAnchor();
+    return Array.from(webglState.candidates.values()).map((c) => ({
+      ...c,
+      score: Math.round(scoreWebglCandidate(c, refAnchor) * 100) / 100,
+      continuity: Math.round(candidateContinuityWithObserver(c) * 1000) / 1000,
+      ageMs: Math.round(nowMs - c.lastSeenMs),
+      changeAgeMs: Math.round(nowMs - c.lastChangeMs),
+    })).sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.changes !== a.changes) return b.changes - a.changes;
+      if (b.calls !== a.calls) return b.calls - a.calls;
+      return a.avgErr - b.avgErr;
+    });
+  }
+
+  function sourceLabelForItem(item) {
+    const name = item.uniformName ? item.uniformName : item.locId;
+    const lock = item.id === webglState.lockedId ? '* ' : '';
+    const age = item.ageMs + 'ms';
+    const continuityPct = Math.round((item.continuity || 0) * 100);
+    return lock + name + ' | c ' + continuityPct + '% | chg ' + item.changes + ' | age ' + age;
+  }
+
+  function refreshSourceControls(nowMs = performance.now()) {
+    if (!sourceSelect || !conventionSelect) return;
+
+    const targetConvention = normalizeWebglConvention(config.webglConvention);
+    if (conventionSelect.value !== targetConvention) {
+      conventionSelect.value = targetConvention;
+    }
+
+    const items = listWebglSourceItems(findWidgetAnchor(), nowMs).slice(0, 18);
+    const preferredKey = config.preferredWebglSource
+      ? ((config.preferredWebglSource.uniformName || '') + ':' + (config.preferredWebglSource.locHint || ''))
+      : 'none';
+    const signature = preferredKey + '|' + (webglState.lockedId || '-') + '|' + items.map((i) => i.id + ':' + i.ageMs + ':' + i.changes + ':' + (i.id === webglState.lockedId ? 'L' : '-')).join('|');
+    if (signature === sourceOptionsSignature && sourceSelect.options.length > 0) return;
+    sourceOptionsSignature = signature;
+
+    const currentValue = sourceSelect.value || '';
+    sourceSelect.textContent = '';
+
+    const autoOpt = document.createElement('option');
+    autoOpt.value = '';
+    autoOpt.textContent = 'Auto source (ranked)';
+    sourceSelect.appendChild(autoOpt);
+
+    for (const item of items) {
+      const opt = document.createElement('option');
+      opt.value = item.id;
+      opt.textContent = sourceLabelForItem(item);
+      sourceSelect.appendChild(opt);
+    }
+
+    let selectedValue = currentValue;
+    if (config.preferredWebglSource) {
+      const preferred = items.find((i) => preferredMatchesCandidate(i));
+      if (preferred) selectedValue = preferred.id;
+    } else if (webglState.lockedId) {
+      const locked = items.find((i) => i.id === webglState.lockedId);
+      if (locked) selectedValue = locked.id;
+    }
+
+    const hasSelected = Array.from(sourceSelect.options).some((o) => o.value === selectedValue);
+    sourceSelect.value = hasSelected ? selectedValue : '';
+  }
+
+  function resetWebglLock() {
+    webglState.lockedId = null;
+    webglState.convention = null;
+    webglState.lockLastCheckedMs = 0;
+  }
+
   function normalizeFallbackMode(mode) {
-    if (mode === 'matrix' || mode === 'labels' || mode === 'legacy-pixels') return mode;
-    return mode === 'auto' ? 'labels' : 'labels';
+    if (mode === 'auto' || mode === 'dom' || mode === 'semantic') return mode;
+    // Backward compatibility with older stored values.
+    if (mode === 'matrix') return 'dom';
+    if (mode === 'labels' || mode === 'legacy-pixels') return 'auto';
+    return 'auto';
+  }
+
+  function normalizeWebglConvention(mode) {
+    if (mode === 'raw' || mode === 'inverse' || mode === 'auto') return mode;
+    return 'auto';
   }
 
   function fallbackModeLabel(mode) {
     const m = normalizeFallbackMode(mode);
-    if (m === 'matrix') return 'Mode: Matrix';
-    if (m === 'legacy-pixels') return 'Mode: Legacy Pixels';
-    return 'Mode: Labels';
+    if (m === 'dom') return 'Secondary: DOM';
+    if (m === 'semantic') return 'Secondary: Semantic';
+    return 'Secondary: Auto';
   }
 
   function observerIsStale(nowMs = performance.now()) {
     return !observerRawQuat || (nowMs - observerLastUpdateMs) > STALE_MS;
+  }
+
+  function publishOrientation(nowMs) {
+    if (!observerQuat) return;
+    if ((nowMs - observerLastPublishMs) < 30) return;
+
+    const e = quatToEuler(observerQuat);
+    const payload = {
+      timestamp: Date.now(),
+      quat: {
+        w: observerQuat.w,
+        x: observerQuat.x,
+        y: observerQuat.y,
+        z: observerQuat.z,
+      },
+      eulerDeg: {
+        yaw: e.yaw * 180 / Math.PI,
+        pitch: e.pitch * 180 / Math.PI,
+        roll: e.roll * 180 / Math.PI,
+      },
+      strategy: observerStrategy,
+      confidence: observerConfidence,
+      stale: observerIsStale(nowMs),
+    };
+
+    window.__usbFreeDLastOrientation = payload;
+    window.dispatchEvent(new CustomEvent('orientation:update', { detail: payload }));
+    observerLastPublishMs = nowMs;
   }
 
   function inWidgetZone(rect) {
@@ -1584,37 +2239,38 @@
 
     const info = collectWidgetCandidates();
     const candidates = info.candidates;
-    let sample = extractFromCssMatrix(candidates, info.anchor);
     const mode = normalizeFallbackMode(config.fallbackMode);
-    const labels = collectWidgetLabels(candidates, info.anchor);
-    const axisVisible = ['x', 'y', 'z'].filter((k) => labels.axis[k].length > 0).length;
-    const faceVisible = ['front', 'back', 'left', 'right', 'top', 'bottom'].filter((k) => labels.faces[k].length > 0).length;
-    const axisTrusted = ['x', 'y', 'z'].filter((k) => labels.axis[k].some((e) => isTrustedLabelEntry(e))).length;
-    const faceTrusted = ['front', 'back', 'left', 'right', 'top', 'bottom'].filter((k) => labels.faces[k].some((e) => isTrustedLabelEntry(e))).length;
+
+    let sample = extractFromWebglUniform(info.anchor, nowMs);
+    if (!sample && mode !== 'semantic') {
+      sample = extractFromCssMatrix(candidates, info.anchor);
+    }
+
+    let labels = null;
+    let axisVisible = 0;
+    let faceVisible = 0;
+    let axisTrusted = 0;
+    let faceTrusted = 0;
     let unresolvedReason = '';
 
-    if (!sample && mode !== 'matrix') {
+    if (!sample && mode !== 'dom') {
+      labels = collectWidgetLabels(candidates, info.anchor);
+      axisVisible = ['x', 'y', 'z'].filter((k) => labels.axis[k].length > 0).length;
+      faceVisible = ['front', 'back', 'left', 'right', 'top', 'bottom'].filter((k) => labels.faces[k].length > 0).length;
+      axisTrusted = ['x', 'y', 'z'].filter((k) => labels.axis[k].some((e) => isTrustedLabelEntry(e))).length;
+      faceTrusted = ['front', 'back', 'left', 'right', 'top', 'bottom'].filter((k) => labels.faces[k].some((e) => isTrustedLabelEntry(e))).length;
       sample = extractFromSvgLabels(candidates);
-    }
 
-    if (!sample && mode !== 'matrix') {
-      sample = extractFromHtmlAxisLabels(labels, info.anchor);
-    }
+      if (!sample) {
+        sample = extractFromHtmlAxisLabels(labels, info.anchor);
+      }
 
-    if (!sample && mode !== 'matrix') {
-      sample = extractFromFaceLabels(labels, info.anchor);
-    }
-
-    if (!sample && mode === 'legacy-pixels') {
-      const pixel = extractFromCanvasPixels(candidates, info.anchor);
-      if (pixel.sample) {
-        sample = pixel.sample;
-      } else if (pixel.diagnostics && pixel.diagnostics.reason) {
-        unresolvedReason = 'pixel probe: ' + pixel.diagnostics.reason;
+      if (!sample) {
+        sample = extractFromFaceLabels(labels, info.anchor);
       }
     }
 
-    if (!sample && !unresolvedReason && mode !== 'matrix') {
+    if (!sample && !unresolvedReason && mode !== 'dom') {
       unresolvedReason =
         'labels unresolved: axis=' + axisVisible + ', face=' + faceVisible +
         ' | trusted axis=' + axisTrusted + ', trusted face=' + faceTrusted;
@@ -1626,7 +2282,7 @@
       if (unresolvedReason) {
         observerDebug = unresolvedReason;
       } else {
-        observerDebug = info.anchor ? 'widget anchor found but orientation unresolved' : 'widget anchor not found';
+        observerDebug = info.anchor ? 'orientation unresolved from webgl/dom sources' : 'widget anchor not found';
       }
       return;
     }
@@ -1647,6 +2303,7 @@
     observerConfidence = sample.confidence;
     observerDebug = sample.debug;
     observerLastUpdateMs = nowMs;
+    publishOrientation(nowMs);
   }
 
   function makeDraggable(el, handle) {
@@ -1685,7 +2342,21 @@
       <div class="usb-freed-body">
         <div class="usb-freed-row">
           <button id="usb-freed-watch-toggle" class="usb-freed-btn usb-freed-btn-sm">Watcher ON</button>
-          <button id="usb-freed-watch-fallback" class="usb-freed-btn usb-freed-btn-sm">Fallback: Auto</button>
+          <button id="usb-freed-watch-fallback" class="usb-freed-btn usb-freed-btn-sm">Secondary: Auto</button>
+        </div>
+
+        <div class="usb-freed-row">
+          <label class="usb-freed-label">Source</label>
+          <select id="usb-freed-source-select" class="usb-freed-select"></select>
+        </div>
+
+        <div class="usb-freed-row">
+          <label class="usb-freed-label">Input</label>
+          <select id="usb-freed-convention" class="usb-freed-select">
+            <option value="auto">Auto</option>
+            <option value="raw">Raw</option>
+            <option value="inverse">Inverse</option>
+          </select>
         </div>
 
         <div class="usb-freed-row">
@@ -1713,6 +2384,8 @@
 
     toggleBtn = panel.querySelector('#usb-freed-watch-toggle');
     fallbackBtn = panel.querySelector('#usb-freed-watch-fallback');
+    sourceSelect = panel.querySelector('#usb-freed-source-select');
+    conventionSelect = panel.querySelector('#usb-freed-convention');
     smoothSlider = panel.querySelector('#usb-freed-watch-smooth');
     smoothVal = panel.querySelector('#usb-freed-watch-smooth-val');
     calibrateBtn = panel.querySelector('#usb-freed-cal-front');
@@ -1740,10 +2413,32 @@
 
     fallbackBtn.addEventListener('click', () => {
       const mode = normalizeFallbackMode(config.fallbackMode);
-      if (mode === 'labels') config.fallbackMode = 'matrix';
-      else if (mode === 'matrix') config.fallbackMode = 'legacy-pixels';
-      else config.fallbackMode = 'labels';
+      if (mode === 'auto') config.fallbackMode = 'dom';
+      else if (mode === 'dom') config.fallbackMode = 'semantic';
+      else config.fallbackMode = 'auto';
       saveConfig();
+      updatePanel();
+    });
+
+    sourceSelect.addEventListener('change', () => {
+      const chosen = sourceSelect.value;
+      if (!chosen) {
+        clearPreferredWebglSource();
+      } else {
+        const pinned = pinPreferredWebglSource(chosen);
+        if (!pinned) {
+          observerDebug = 'selected source unavailable; keeping auto';
+          clearPreferredWebglSource();
+        }
+      }
+      resetWebglLock();
+      updatePanel();
+    });
+
+    conventionSelect.addEventListener('change', () => {
+      config.webglConvention = normalizeWebglConvention(conventionSelect.value);
+      saveConfig();
+      webglState.convention = null;
       updatePanel();
     });
 
@@ -1772,6 +2467,7 @@
 
     makeDraggable(panel, panel.querySelector('.usb-freed-header'));
     drawOrientationPreview(null, true);
+    refreshSourceControls();
     updatePanel();
   }
 
@@ -1781,6 +2477,9 @@
     toggleBtn.textContent = config.watcherEnabled ? 'Watcher ON' : 'Watcher OFF';
     toggleBtn.classList.toggle('usb-freed-btn-active', config.watcherEnabled);
     fallbackBtn.textContent = fallbackModeLabel(config.fallbackMode);
+    refreshSourceControls(performance.now());
+    sourceSelect.disabled = !config.watcherEnabled;
+    conventionSelect.disabled = !config.watcherEnabled;
     const calOn = calibrationEnabled();
     clearCalBtn.classList.toggle('usb-freed-btn-active', calOn);
 
@@ -1863,6 +2562,7 @@
 
   function init() {
     installGlobalErrorHooks();
+    installWebglHooks();
     createPanel();
     window.usbFreeDWidgetWatcher = {
       buildTag: BUILD_TAG,
@@ -1875,18 +2575,45 @@
         rawQuat: observerRawQuat,
         quat: observerQuat,
         calibration: getCalibrationQuat(),
+        webglConvention: normalizeWebglConvention(config.webglConvention),
+        lockedWebglSourceId: webglState.lockedId,
+        preferredWebglSource: config.preferredWebglSource,
+        lastOrientation: window.__usbFreeDLastOrientation || null,
         lastError: observerLastError,
       }),
       dumpCandidates: () => debugDumpCandidates(),
       dumpNeighborhood: () => debugDumpNeighborhood(),
       dumpLabels: () => debugDumpLabels(),
       dumpPixelProbe: () => debugDumpPixelProbe(),
+      dumpWebglSources: () => debugDumpWebglSources(),
+      listWebglSources: () => listWebglSourceItems(findWidgetAnchor(), performance.now()).slice(0, 40).map((c) => ({
+        id: c.id,
+        uniformName: c.uniformName || '',
+        programId: c.programId || '',
+        score: c.score,
+        calls: c.calls,
+        changes: c.changes,
+        ageMs: c.ageMs,
+        locked: c.id === webglState.lockedId,
+        preferredMatch: preferredMatchesCandidate(c),
+      })),
+      pinLockedWebglSource: () => pinPreferredWebglSource(null),
+      pinWebglSourceById: (id) => pinPreferredWebglSource(id),
+      clearPinnedWebglSource: () => clearPreferredWebglSource(),
+      relockWebglSource: () => resetWebglLock(),
       calibrateCurrentAsFront: () => calibrateCurrentAsFront(),
       clearCalibration: () => clearCalibration(),
     };
     window.setInterval(tick, 80);
     tick();
     console.log('[USB_freeD] Widget watcher loaded (' + BUILD_TAG + ') on', window.location.hostname);
+  }
+
+  // Hook as early as possible so WebGL uniforms can be observed during page startup.
+  try {
+    installWebglHooks();
+  } catch (e) {
+    setLastError('webgl.install-early', e, null);
   }
 
   if (document.readyState === 'loading') {

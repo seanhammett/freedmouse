@@ -123,6 +123,21 @@
   cursor: pointer;
 }
 
+.usb-freed-select {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  background: #11111b;
+  border: 1px solid #45475a;
+  border-radius: 4px;
+  color: #cdd6f4;
+  font-size: 10px;
+}
+
+.usb-freed-select:disabled {
+  opacity: 0.6;
+}
+
 .usb-freed-data {
   background: #11111b;
   border-radius: 4px;
