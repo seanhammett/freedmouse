@@ -8,7 +8,7 @@
   const STORAGE_KEY = 'usbFreeDWidgetWatcherConfig';
   const SCAN_INTERVAL_MS = 220;
   const STALE_MS = 1600;
-  const BUILD_TAG = 'watcher-2026-04-22-safe-2';
+  const BUILD_TAG = 'watcher-2026-04-22-safe-3';
 
   let config = loadConfig();
 
@@ -739,6 +739,16 @@
     }
 
     const faceWords = new Set(['front', 'back', 'left', 'right', 'top', 'bottom']);
+    const hasTransformInChain = (el, maxDepth = 3) => {
+      let node = el;
+      for (let depth = 0; depth <= maxDepth && node; depth++) {
+        const style = window.getComputedStyle(node);
+        const t = style.transform || style.webkitTransform || 'none';
+        if (t && t !== 'none') return true;
+        node = node.parentElement;
+      }
+      return false;
+    };
     const pushSample = (source, raw) => {
       if (!raw) return;
       const t = String(raw).trim();
@@ -768,6 +778,7 @@
         dist,
         area: r.width * r.height,
         source,
+        moving: hasTransformInChain(el, 3),
         tag: (el.tagName || '').toLowerCase(),
       };
 
@@ -783,36 +794,43 @@
 
       const rawTexts = [];
       const tc = (el.textContent || '').trim();
-      if (tc && tc.length <= 24) rawTexts.push(tc);
+      if (tc && tc.length <= 24) rawTexts.push({ raw: tc, source: 'textContent', tokenizable: true });
 
       const aria = el.getAttribute && el.getAttribute('aria-label');
-      if (aria && aria.trim().length <= 24) rawTexts.push(aria.trim());
+      if (aria && aria.trim().length <= 24) rawTexts.push({ raw: aria.trim(), source: 'aria-label', tokenizable: true });
 
       const title = el.getAttribute && el.getAttribute('title');
-      if (title && title.trim().length <= 24) rawTexts.push(title.trim());
+      if (title && title.trim().length <= 24) rawTexts.push({ raw: title.trim(), source: 'title', tokenizable: true });
 
-      if (el.id && el.id.length <= 48) rawTexts.push(el.id);
-      if (typeof el.className === 'string' && el.className.trim() && el.className.length <= 120) rawTexts.push(el.className);
+      if (el.id && el.id.length <= 48) rawTexts.push({ raw: el.id, source: 'id', tokenizable: false });
+      if (typeof el.className === 'string' && el.className.trim() && el.className.length <= 120) {
+        rawTexts.push({ raw: el.className, source: 'className', tokenizable: false });
+      }
 
       if (el.attributes && el.attributes.length) {
         for (let i = 0; i < el.attributes.length; i++) {
           const attr = el.attributes[i];
           if (!attr) continue;
-          if (attr.name && attr.name.length <= 40) rawTexts.push(attr.name);
-          if (attr.value && attr.value.length <= 64) rawTexts.push(attr.value);
+          const attrName = (attr.name || '').toLowerCase();
+          const isLabelAttr = attrName === 'aria-label' || attrName === 'title' || attrName === 'data-label' || attrName === 'data-face' || attrName === 'data-axis';
+          if (attr.name && attr.name.length <= 40) rawTexts.push({ raw: attr.name, source: 'attrName', tokenizable: false });
+          if (attr.value && attr.value.length <= 64) {
+            rawTexts.push({ raw: attr.value, source: 'attrValue', tokenizable: isLabelAttr });
+          }
         }
       }
 
       const before = window.getComputedStyle(el, '::before').content;
       const after = window.getComputedStyle(el, '::after').content;
-      if (before && before !== 'none') rawTexts.push(before.replace(/^['"]|['"]$/g, ''));
-      if (after && after !== 'none') rawTexts.push(after.replace(/^['"]|['"]$/g, ''));
+      if (before && before !== 'none') rawTexts.push({ raw: before.replace(/^['"]|['"]$/g, ''), source: 'pseudo', tokenizable: true });
+      if (after && after !== 'none') rawTexts.push({ raw: after.replace(/^['"]|['"]$/g, ''), source: 'pseudo', tokenizable: true });
 
-      for (const raw of rawTexts) {
-        pushSample('raw', raw);
-        const tokens = tokenize(raw);
+      for (const item of rawTexts) {
+        pushSample(item.source, item.raw);
+        if (item.tokenizable === false) continue;
+        const tokens = tokenize(item.raw);
         for (const token of tokens) {
-          addToken(token, el, 'text');
+          addToken(token, el, item.source);
         }
       }
     }
@@ -820,11 +838,27 @@
     return out;
   }
 
-  function pickBestLabel(entries) {
+  function isVisualLabelSource(source) {
+    return source === 'textContent' || source === 'aria-label' || source === 'title' || source === 'pseudo';
+  }
+
+  function isTrustedLabelEntry(entry) {
+    if (!entry) return false;
+    if (isVisualLabelSource(entry.source)) return true;
+    if (!entry.moving) return false;
+    return entry.source === 'className' || entry.source === 'id' || entry.source === 'attrValue';
+  }
+
+  function pickBestLabel(entries, predicate) {
     if (!entries || !entries.length) return null;
     let best = null;
     for (const e of entries) {
-      const score = e.dist * 1.15 + Math.min(20, Math.sqrt(Math.max(0, e.area)) * 0.5);
+      if (predicate && !predicate(e)) continue;
+      const sourceBonus = isVisualLabelSource(e.source) ? 26 : (e.moving ? 8 : -18);
+      const movingBonus = e.moving ? 8 : 0;
+      const proximityScore = Math.max(0, 220 - e.dist) * 1.1;
+      const sizeScore = Math.min(16, Math.sqrt(Math.max(0, e.area)) * 0.4);
+      const score = proximityScore + sizeScore + sourceBonus + movingBonus;
       if (!best || score > best.score) best = { entry: e, score };
     }
     return best ? best.entry : null;
@@ -842,6 +876,7 @@
           y: Math.round(e.center.y),
           tag: e.tag,
           source: e.source,
+          moving: !!e.moving,
         }));
       }
       return out;
@@ -856,24 +891,89 @@
     };
   }
 
-  function extractFromCssMatrix(candidates) {
-    for (const el of candidates) {
-      let node = el;
+  function extractFromCssMatrix(candidates, anchor) {
+    const roots = [];
+    const rootSeen = new Set();
+
+    const addRoot = (el) => {
+      if (!el || rootSeen.has(el)) return;
+      rootSeen.add(el);
+      roots.push(el);
+    };
+
+    for (const el of candidates) addRoot(el);
+    if (anchor) {
+      let node = anchor;
       for (let depth = 0; depth < 5 && node; depth++) {
-        const style = window.getComputedStyle(node);
-        const q = parseMatrix3d(style.transform) || parseMatrix3d(style.webkitTransform);
-        if (q) {
-          return {
-            quat: q,
-            confidence: 0.97,
-            strategy: 'css-matrix3d',
-            debug: 'orientation from DOM transform matrix',
-          };
-        }
+        addRoot(node);
         node = node.parentElement;
       }
     }
-    return null;
+
+    const anchorRect = anchor ? anchor.getBoundingClientRect() : null;
+    const anchorCenter = anchorRect ? centerOfRect(anchorRect) : null;
+    const evalSeen = new Set();
+    let best = null;
+
+    const scoreNode = (rect) => {
+      let score = Math.min(90, Math.sqrt(Math.max(0, rect.width * rect.height)) * 0.9);
+      if (anchorCenter) {
+        const c = centerOfRect(rect);
+        const dist = Math.hypot(c.x - anchorCenter.x, c.y - anchorCenter.y);
+        score += Math.max(0, 260 - dist);
+      }
+      return score;
+    };
+
+    const considerNode = (el, strategy) => {
+      if (!el || evalSeen.has(el)) return;
+      evalSeen.add(el);
+
+      const rect = el.getBoundingClientRect();
+      if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)) return;
+      if (rect.width <= 1 || rect.height <= 1 || rect.width > 900 || rect.height > 900) return;
+
+      const style = window.getComputedStyle(el);
+      const q = parseMatrix3d(style.transform) || parseMatrix3d(style.webkitTransform);
+      if (!q) return;
+
+      const score = scoreNode(rect);
+      if (!best || score > best.score) {
+        best = { quat: q, score, strategy };
+      }
+    };
+
+    for (const root of roots) {
+      let node = root;
+      for (let depth = 0; depth < 5 && node; depth++) {
+        considerNode(node, 'css-matrix3d');
+        node = node.parentElement;
+      }
+    }
+
+    let inspectedDescendants = 0;
+    for (const root of roots) {
+      if (!root || !root.querySelectorAll) continue;
+      let localCount = 0;
+      for (const el of root.querySelectorAll('*')) {
+        considerNode(el, 'css-matrix3d-desc');
+        localCount++;
+        inspectedDescendants++;
+        if (localCount >= 140 || inspectedDescendants >= 360) break;
+      }
+      if (inspectedDescendants >= 360) break;
+    }
+
+    if (!best) return null;
+
+    return {
+      quat: best.quat,
+      confidence: best.strategy === 'css-matrix3d' ? 0.97 : 0.95,
+      strategy: best.strategy,
+      debug: best.strategy === 'css-matrix3d'
+        ? 'orientation from DOM transform matrix'
+        : 'orientation from descendant DOM transform matrix',
+    };
   }
 
   function centerOfRect(rect) {
@@ -974,10 +1074,13 @@
     const anchorRect = anchor.getBoundingClientRect();
     const origin = centerOfRect(anchorRect);
     const selected = {
-      x: pickBestLabel(labels.axis.x),
-      y: pickBestLabel(labels.axis.y),
-      z: pickBestLabel(labels.axis.z),
+      x: pickBestLabel(labels.axis.x, isTrustedLabelEntry),
+      y: pickBestLabel(labels.axis.y, isTrustedLabelEntry),
+      z: pickBestLabel(labels.axis.z, isTrustedLabelEntry),
     };
+    const selectedEntries = Object.values(selected).filter(Boolean);
+    const strongEvidenceCount = selectedEntries.filter((e) => isVisualLabelSource(e.source) || e.moving).length;
+    if (strongEvidenceCount < 2) return null;
 
     const axisData = {};
     const presentAxes = [];
@@ -1070,7 +1173,7 @@
 
     const axisChoice = { x: null, y: null, z: null };
     for (const face of Object.keys(faceMap)) {
-      const picked = pickBestLabel(labels.faces[face]);
+      const picked = pickBestLabel(labels.faces[face], isTrustedLabelEntry);
       if (!picked) continue;
       const info = faceMap[face];
       const existing = axisChoice[info.axis];
@@ -1078,6 +1181,9 @@
         axisChoice[info.axis] = { face, sign: info.sign, entry: picked };
       }
     }
+    const chosenEntries = Object.values(axisChoice).filter(Boolean).map((v) => v.entry);
+    const strongEvidenceCount = chosenEntries.filter((e) => isVisualLabelSource(e.source) || e.moving).length;
+    if (strongEvidenceCount < 2) return null;
 
     const origin = centerOfRect(anchor.getBoundingClientRect());
     const presentAxes = [];
@@ -1478,11 +1584,13 @@
 
     const info = collectWidgetCandidates();
     const candidates = info.candidates;
-    let sample = extractFromCssMatrix(candidates);
+    let sample = extractFromCssMatrix(candidates, info.anchor);
     const mode = normalizeFallbackMode(config.fallbackMode);
     const labels = collectWidgetLabels(candidates, info.anchor);
     const axisVisible = ['x', 'y', 'z'].filter((k) => labels.axis[k].length > 0).length;
     const faceVisible = ['front', 'back', 'left', 'right', 'top', 'bottom'].filter((k) => labels.faces[k].length > 0).length;
+    const axisTrusted = ['x', 'y', 'z'].filter((k) => labels.axis[k].some((e) => isTrustedLabelEntry(e))).length;
+    const faceTrusted = ['front', 'back', 'left', 'right', 'top', 'bottom'].filter((k) => labels.faces[k].some((e) => isTrustedLabelEntry(e))).length;
     let unresolvedReason = '';
 
     if (!sample && mode !== 'matrix') {
@@ -1507,7 +1615,9 @@
     }
 
     if (!sample && !unresolvedReason && mode !== 'matrix') {
-      unresolvedReason = 'labels unresolved: axis=' + axisVisible + ', face=' + faceVisible;
+      unresolvedReason =
+        'labels unresolved: axis=' + axisVisible + ', face=' + faceVisible +
+        ' | trusted axis=' + axisTrusted + ', trusted face=' + faceTrusted;
     }
 
     if (!sample || !sample.quat) {
