@@ -23,32 +23,28 @@ Pixel sampling is inherently fragile because it depends on:
 - Anti-aliasing and GPU rendering differences.
 - Zoom and DPI scaling.
 
-Instead, use WebGL matrix/uniform updates as the primary source of truth.
-Use DOM transform data from the cube element hierarchy as a secondary path when it is actually exposed.
+Instead, use DOM transform data from the cube element hierarchy as the primary source of truth.
 
 
 ## Recommended System Design
 
 ### 1. Source Discovery Layer
 
-Create a dedicated discovery module that determines which orientation source is available in the current Onshape session.
+Create a dedicated discovery module that finds the cube root and transform-bearing descendants.
 
 Recommended approach:
 
 1. Start from the known anchor region near the top-right corner.
-2. Probe DOM/SVG descendants for transform-bearing nodes (css matrix3d(...) or SVG transform attributes).
-3. Probe WebGL uniformMatrix4fv updates and keep rotation-like 4x4 candidates.
-4. Keep only candidates correlated with the cube region and view interaction.
-5. Rank candidates by:
+2. Search for elements whose computed transform is matrix3d(...).
+3. Keep only candidates within the cube bounds neighborhood.
+4. Rank candidates by:
    - Proximity to anchor center.
    - Transform persistence across frames.
    - Rotation-like matrix characteristics (orthonormal 3x3 block).
-   - Correlation with camera orbit/snap actions.
 
 Result: a locked Orientation Source object with:
 
-- source type (webgl-uniform, css-matrix3d, semantic-dom)
-- handle (uniform id/context or element reference)
+- element reference
 - extraction method
 - confidence
 - last-valid timestamp
@@ -56,28 +52,21 @@ Result: a locked Orientation Source object with:
 
 ### 2. Orientation Extraction Layer (Primary)
 
-Primary extraction should be WebGL matrix-based:
+Primary extraction should be matrix-based:
 
-1. Intercept WebGL/WebGL2 uniformMatrix4fv uploads.
-2. Identify rotation-like 4x4 matrices and lock to the best candidate by temporal stability and motion.
+1. Read computed style transform.
+2. Parse matrix3d into 4x4.
 3. Extract the rotation block.
 4. Re-orthonormalize basis vectors to remove numerical drift.
 5. Convert matrix to quaternion.
 6. Normalize quaternion each frame.
-7. Apply optional inversion/convention mapping once and keep it fixed for the session.
 
-Secondary extraction path (when available):
-
-1. Read computed style transform.
-2. Parse matrix3d into 4x4.
-3. Apply the same rotation -> quaternion pipeline.
-
-This is independent of color and hover because orientation data comes from scene transforms, not rendered pixel values.
+This is independent of color and hover because transforms stay valid when visual styling changes.
 
 
 ### 3. Fallback Strategy (No Pixel Tracking)
 
-If both WebGL and DOM matrix data are unavailable, use semantic DOM fallback only:
+If matrix data disappears, use semantic DOM fallback only:
 
 - SVG or HTML label geometry (X, Y, Z or face labels) for temporary recovery.
 - Keep this as lower confidence and short-lived.
@@ -130,7 +119,7 @@ Suggested payload:
   "timestamp": 1713870000000,
   "quat": { "w": 0.9921, "x": 0.0152, "y": -0.1214, "z": 0.0201 },
   "eulerDeg": { "yaw": -13.9, "pitch": -1.8, "roll": 1.6 },
-   "strategy": "webgl-uniform-matrix4fv",
+  "strategy": "css-matrix3d",
   "confidence": 0.97,
   "stale": false
 }
@@ -156,25 +145,11 @@ Critical requirement: this preview must never read pixels from Onshape. It shoul
 
 ### Background Independence
 
-Orientation extraction is based on WebGL/transform matrices, not color values. Overlaying the cube over any viewport color does not affect orientation readout.
+Transform extraction is based on DOM geometry and CSS transforms, not color values. Overlaying the cube over any viewport color does not affect orientation readout.
 
 ### Hover Independence
 
-Hover changes fill, highlights, and visible labels, but does not alter the camera/view rotation state used by the matrix source. Matrix tracking remains stable through hover transitions.
-
-
-## Validated Finding In Current Onshape Session
-
-Observed behavior from live inspection:
-
-- The cube bounds container and ancestor chain did not expose CSS/SVG transform matrices.
-- The cube region overlapped the main `canvas#canvas`.
-- WebGL uniform probes showed high-frequency rotation-like matrix updates correlated with orbit motion.
-
-Conclusion:
-
-- For this environment, WebGL matrix/uniform extraction is the reliable primary orientation source.
-- DOM matrix extraction remains useful as an optional path for builds that expose cube transforms in DOM.
+Hover changes fill, highlights, and visible labels, but does not typically alter the cube's underlying 3D orientation transform. Matrix tracking remains stable through hover transitions.
 
 
 ## Implementation Plan
@@ -183,13 +158,11 @@ Conclusion:
 
 1. Split current content script into modules:
    - source discovery
-   - webgl matrix extraction
-   - optional DOM matrix extraction
+   - matrix extraction
    - quaternion math
    - panel and preview
-2. Promote WebGL extraction to strict primary strategy.
-3. Keep DOM matrix extraction as automatic secondary path.
-4. Disable pixel fallback behind a debug flag.
+2. Promote matrix extraction to strict primary strategy.
+3. Disable pixel fallback behind a debug flag.
 
 ### Phase 2 - State and Output Contract
 
@@ -205,7 +178,6 @@ Conclusion:
    - hover sweep over all cube faces
    - light and dark model backgrounds
    - fast orbit and snap-to-face actions
-   - WebGL-rendered cube sessions and DOM-exposed cube sessions
 
 
 ## Acceptance Criteria
@@ -226,8 +198,7 @@ Current script already has strong quaternion math and preview drawing. Keep thos
 Refactor emphasis:
 
 - Keep: quaternion normalization, lerp, matrix conversion, preview renderer.
-- Add/keep: WebGL uniform matrix capture and source locking.
-- Keep: css matrix extraction path as secondary.
+- Keep: css matrix extraction path.
 - Reduce or remove in production: legacy pixel probe path.
 - Treat label-based methods as temporary degraded fallback only.
 
@@ -236,8 +207,7 @@ Refactor emphasis:
 
 Best long-term architecture for this extension:
 
-- WebGL-matrix-first orientation tracking.
-- DOM-matrix secondary path when available.
+- Matrix-first orientation tracking.
 - Semantic fallback only.
 - No pixel dependency in production.
 - Explicit confidence and stale-state model.
