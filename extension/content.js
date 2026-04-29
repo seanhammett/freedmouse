@@ -18,6 +18,15 @@
   const WEBGL_MIN_CHANGES = 6;
   const WEBGL_SWITCH_MARGIN = 220;
   const WEBGL_SWITCH_RATIO = 1.28;
+  // Preferred locId hints tried first on each page load (before scored auto-selection).
+  // locIds are assigned by WebGL encounter order, which is deterministic for Onshape.
+  const WEBGL_DEFAULT_LOC_HINTS = ['u_6', 'u_7'];
+  // Fast-path scan interval when a WebGL source is already locked.
+  // Full candidate re-evaluation still uses SCAN_INTERVAL_MS.
+  const SCAN_INTERVAL_LOCKED_MS = 50;
+  // Serial target packet: header byte must match target_packet.h TARGET_HEADER
+  const TARGET_HEADER = 0xBB;
+  const TARGET_PACKET_SIZE = 19;
 
   let config = loadConfig();
 
@@ -30,6 +39,17 @@
   let observerLastScanMs = 0;
   let observerLastPublishMs = 0;
   let observerLastError = null;
+
+  // CSS/DOM-derived orientation reference updated independently of the WebGL lock.
+  // Used to bootstrap WebGL candidate scoring and break circular self-confirmation.
+  let cssReferenceQuat = null;
+
+  // =================== WEB SERIAL STATE ===================
+  let serialPort = null;
+  let serialWriter = null;
+  let serialConnected = false;
+  let serialSeq = 0;
+  let serialBtn = null;  // panel button reference
 
   let panel = null;
   let statusEl = null;
@@ -66,16 +86,22 @@
     lockedId: null,
     lockLastCheckedMs: 0,
     convention: null,
+    // In-memory exact pin set when user explicitly selects a source from the dropdown.
+    // Keyed on the locId (WeakMap-stable within a page session); bypasses all scoring.
+    // Not persisted — cleared on page reload along with the rest of webglState.
+    pinnedLocId: null,
   };
 
   function sanitizePreferredWebglSource(pref) {
     if (!pref || typeof pref !== 'object') return null;
     const uniformName = typeof pref.uniformName === 'string' ? pref.uniformName.trim() : '';
     const locHint = typeof pref.locHint === 'string' ? pref.locHint.trim() : '';
-    if (!uniformName && !locHint) return null;
+    const canvasSize = typeof pref.canvasSize === 'string' ? pref.canvasSize.trim() : '';
+    if (!uniformName && !locHint && !canvasSize) return null;
     return {
       uniformName: uniformName || null,
       locHint: locHint || null,
+      canvasSize: canvasSize || null,
     };
   }
 
@@ -115,7 +141,7 @@
       watcherEnabled: true,
       fallbackMode: 'auto',
       webglConvention: 'auto',
-      smoothing: 0.3,
+      smoothing: 0.95,
       frameCalibration: null,
       preferredWebglSource: null,
     };
@@ -325,11 +351,13 @@
     // Flip Z in render space so cube depth matches the widget's convex orientation.
     const toRenderFrame = (v) => [v[0], v[1], -v[2]];
 
-    // Corner-anchored cube: vertex 0 is at origin and edges extend along +X/+Y/+Z.
+    // Centered cube: vertices span [-half, +half] on each axis so rotation is
+    // about the cube's geometric center, which coincides with the axes origin.
     const cubeSize = 1.16;
+    const half = cubeSize / 2;
     const cubeVerts = [
-      [0, 0, 0], [cubeSize, 0, 0], [cubeSize, cubeSize, 0], [0, cubeSize, 0],
-      [0, 0, cubeSize], [cubeSize, 0, cubeSize], [cubeSize, cubeSize, cubeSize], [0, cubeSize, cubeSize],
+      [-half, -half, -half], [ half, -half, -half], [ half,  half, -half], [-half,  half, -half],
+      [-half, -half,  half], [ half, -half,  half], [ half,  half,  half], [-half,  half,  half],
     ];
     const rotated = cubeVerts.map((v) => toRenderFrame(rotateWithMatrix(m, v)));
     const proj = rotated.map((v) => projectPoint3(v, w, h, scale, distance));
@@ -414,10 +442,12 @@
     }
 
     const axisLen = 1.45;
-    const o = projectPoint3(toRenderFrame([0, 0, 0]), w, h, scale, distance);
-    const xAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [axisLen, 0, 0])), w, h, scale, distance);
-    const yAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [0, axisLen, 0])), w, h, scale, distance);
-    const zAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [0, 0, axisLen])), w, h, scale, distance);
+    // Pin axes to vertex 0 (the [-half,-half,-half] corner of the cube).
+    // Axis tips extend from that corner along the cube's local X/Y/Z directions.
+    const o = proj[0];
+    const xAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [-half + axisLen, -half, -half])), w, h, scale, distance);
+    const yAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [-half, -half + axisLen, -half])), w, h, scale, distance);
+    const zAxis = projectPoint3(toRenderFrame(rotateWithMatrix(m, [-half, -half, -half + axisLen])), w, h, scale, distance);
 
     const drawAxis = (p, color, label) => {
       ctx.strokeStyle = color;
@@ -611,7 +641,17 @@
 
   function preferredMatchesCandidate(candidate, preferred = config.preferredWebglSource) {
     if (!candidate || !preferred) return false;
-    if (preferred.uniformName && candidate.uniformName === preferred.uniformName) return true;
+    if (preferred.uniformName && candidate.uniformName === preferred.uniformName) {
+      // If a canvas-size fingerprint was saved, require it to match.
+      // This disambiguates candidates that share a uniformName on the same page.
+      if (preferred.canvasSize) {
+        const cs = candidate.canvasRect
+          ? Math.round(candidate.canvasRect.width) + 'x' + Math.round(candidate.canvasRect.height)
+          : '';
+        return cs === preferred.canvasSize;
+      }
+      return true;
+    }
     if (preferred.locHint && candidate.locId === preferred.locHint) return true;
     return false;
   }
@@ -622,9 +662,18 @@
     const c = webglState.candidates.get(id);
     if (!c) return null;
 
+    // Store the locId for an exact within-session lock (bypasses scoring entirely).
+    webglState.pinnedLocId = c.locId;
+
+    // Persist a fingerprint for cross-reload use: uniformName + canvas size.
+    // Canvas size disambiguates candidates that share the same uniformName.
+    const canvasSize = c.canvasRect
+      ? Math.round(c.canvasRect.width) + 'x' + Math.round(c.canvasRect.height)
+      : '';
     const pref = sanitizePreferredWebglSource({
       uniformName: c.uniformName || '',
       locHint: c.locId || '',
+      canvasSize: canvasSize || '',
     });
     if (!pref) return null;
 
@@ -634,6 +683,7 @@
   }
 
   function clearPreferredWebglSource() {
+    webglState.pinnedLocId = null;
     config.preferredWebglSource = null;
     saveConfig();
   }
@@ -667,26 +717,32 @@
   }
 
   function candidateContinuityWithObserver(candidate) {
-    if (!candidate || !candidate.lastMatrix || !observerRawQuat) return 0.5;
+    if (!candidate || !candidate.lastMatrix) return 0.5;
 
     const raw = matrix16ToQuat(candidate.lastMatrix);
     if (!raw) return 0;
+
+    // Prefer CSS-derived reference over the WebGL-populated observerRawQuat.
+    // This prevents a wrong initial WebGL lock from circularly confirming itself
+    // via the continuity score during candidate re-evaluation.
+    const referenceQuat = cssReferenceQuat || observerRawQuat;
+    if (!referenceQuat) return 0.5;
 
     const forced = config.webglConvention === 'raw' || config.webglConvention === 'inverse'
       ? config.webglConvention
       : 'auto';
 
     if (forced === 'raw') {
-      return Math.abs(quatDot(raw, observerRawQuat));
+      return Math.abs(quatDot(raw, referenceQuat));
     }
 
     const inv = quatConjugate(raw);
     if (forced === 'inverse') {
-      return inv ? Math.abs(quatDot(inv, observerRawQuat)) : 0;
+      return inv ? Math.abs(quatDot(inv, referenceQuat)) : 0;
     }
 
-    const rawDot = Math.abs(quatDot(raw, observerRawQuat));
-    const invDot = inv ? Math.abs(quatDot(inv, observerRawQuat)) : 0;
+    const rawDot = Math.abs(quatDot(raw, referenceQuat));
+    const invDot = inv ? Math.abs(quatDot(inv, referenceQuat)) : 0;
     return Math.max(rawDot, invDot);
   }
 
@@ -707,7 +763,7 @@
     if (challengerScore <= currentScore + WEBGL_SWITCH_MARGIN) return false;
     if (challengerScore <= currentScore * WEBGL_SWITCH_RATIO) return false;
 
-    if (observerRawQuat) {
+    if (cssReferenceQuat || observerRawQuat) {
       const currentContinuity = candidateContinuityWithObserver(current);
       const challengerContinuity = candidateContinuityWithObserver(challenger);
       if (challengerContinuity + 0.06 < currentContinuity) return false;
@@ -949,23 +1005,56 @@
     if (relockNeeded) {
       webglState.lockLastCheckedMs = nowMs;
 
-      let preferred = null;
-      if (config.preferredWebglSource) {
+      // Within-session exact pin: user explicitly picked this locId from the dropdown.
+      // Bypass all scoring — honor the choice unconditionally while the candidate lives.
+      if (webglState.pinnedLocId) {
+        let pinned = null;
         for (const c of webglState.candidates.values()) {
-          if (!c.lastMatrix) continue;
-          if (!preferredMatchesCandidate(c)) continue;
+          if (c.locId !== webglState.pinnedLocId || !c.lastMatrix) continue;
           const ageMs = nowMs - c.lastSeenMs;
-          if (ageMs > WEBGL_CANDIDATE_TTL_MS * 2) continue;
-          if (c.calls < 6) continue;
-          if (!preferred || c.calls > preferred.calls) preferred = c;
+          if (ageMs <= WEBGL_CANDIDATE_TTL_MS * 2) { pinned = c; break; }
         }
-      }
+        if (pinned && webglState.lockedId !== pinned.id) {
+          webglState.lockedId = pinned.id;
+          webglState.convention = null;
+        }
+        // If pinned candidate has gone stale, keep current lock until it returns.
+      } else {
+        // Auto selection: use preferred (cross-reload fingerprint) or best scorer.
+        let preferred = null;
+        if (config.preferredWebglSource) {
+          for (const c of webglState.candidates.values()) {
+            if (!c.lastMatrix) continue;
+            if (!preferredMatchesCandidate(c)) continue;
+            const ageMs = nowMs - c.lastSeenMs;
+            if (ageMs > WEBGL_CANDIDATE_TTL_MS * 2) continue;
+            if (c.calls < 6) continue;
+            if (!preferred || c.calls > preferred.calls) preferred = c;
+          }
+        }
 
-      const target = preferred || chooseBestWebglCandidate(anchor);
-      const current = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
-      if (shouldSwitchWebglLock(current, target, anchor, nowMs)) {
-        webglState.lockedId = target.id;
-        webglState.convention = null;
+        // Before falling back to full scoring, try the default locId hints in order.
+        let defaultHintCandidate = null;
+        if (!preferred) {
+          for (const hint of WEBGL_DEFAULT_LOC_HINTS) {
+            for (const c of webglState.candidates.values()) {
+              if (c.locId !== hint || !c.lastMatrix) continue;
+              const hintAge = nowMs - c.lastSeenMs;
+              if (hintAge > WEBGL_CANDIDATE_TTL_MS * 2) continue;
+              if (c.calls < WEBGL_MIN_CALLS || c.changes < WEBGL_MIN_CHANGES) continue;
+              defaultHintCandidate = c;
+              break;
+            }
+            if (defaultHintCandidate) break;
+          }
+        }
+
+        const target = preferred || defaultHintCandidate || chooseBestWebglCandidate(anchor);
+        const current = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
+        if (shouldSwitchWebglLock(current, target, anchor, nowMs)) {
+          webglState.lockedId = target.id;
+          webglState.convention = null;
+        }
       }
     }
 
@@ -1045,20 +1134,21 @@
   }
 
   function sourceLabelForItem(item) {
-    const name = item.uniformName ? item.uniformName : item.locId;
+    // Always include the locId suffix so entries with the same uniformName remain unique.
+    const baseName = item.uniformName ? item.uniformName : item.locId;
+    const uniqueName = item.uniformName ? baseName + ':' + item.locId : baseName;
     const lock = item.id === webglState.lockedId ? '* ' : '';
+    const pinMark = webglState.pinnedLocId && item.locId === webglState.pinnedLocId ? '! ' : '';
     const age = item.ageMs + 'ms';
     const continuityPct = Math.round((item.continuity || 0) * 100);
-    return lock + name + ' | c ' + continuityPct + '% | chg ' + item.changes + ' | age ' + age;
+    const canvasSz = item.canvasRect
+      ? Math.round(item.canvasRect.width) + 'x' + Math.round(item.canvasRect.height)
+      : '';
+    return lock + pinMark + uniqueName + (canvasSz ? ' [' + canvasSz + ']' : '') + ' | c ' + continuityPct + '% | chg ' + item.changes + ' | age ' + age;
   }
 
   function refreshSourceControls(nowMs = performance.now()) {
-    if (!sourceSelect || !conventionSelect) return;
-
-    const targetConvention = normalizeWebglConvention(config.webglConvention);
-    if (conventionSelect.value !== targetConvention) {
-      conventionSelect.value = targetConvention;
-    }
+    if (!sourceSelect) return;
 
     const items = listWebglSourceItems(findWidgetAnchor(), nowMs).slice(0, 18);
     const preferredKey = config.preferredWebglSource
@@ -1126,6 +1216,80 @@
     return !observerRawQuat || (nowMs - observerLastUpdateMs) > STALE_MS;
   }
 
+  // =================== WEB SERIAL ===================
+
+  async function connectSerial() {
+    if (serialConnected) {
+      await disconnectSerial();
+      return;
+    }
+    if (!navigator.serial) {
+      observerDebug = 'Web Serial API not available (need Chrome with Experimental Web Platform Features enabled for extensions, or chrome://flags/#enable-experimental-web-platform-features)';
+      updatePanel();
+      return;
+    }
+    try {
+      serialPort = await navigator.serial.requestPort();
+      await serialPort.open({ baudRate: 115200 });
+      serialWriter = serialPort.writable.getWriter();
+      serialConnected = true;
+      serialSeq = 0;
+      console.log('[USB_freeD] Serial connected');
+      updatePanel();
+    } catch (e) {
+      serialConnected = false;
+      serialWriter = null;
+      serialPort = null;
+      if (e && e.name !== 'NotFoundError') {
+        // NotFoundError = user cancelled dialog; suppress
+        observerDebug = 'serial connect failed: ' + String(e && e.message ? e.message : e);
+        updatePanel();
+      }
+    }
+  }
+
+  async function disconnectSerial() {
+    serialConnected = false;
+    try {
+      if (serialWriter) { serialWriter.releaseLock(); serialWriter = null; }
+      if (serialPort) { await serialPort.close(); serialPort = null; }
+    } catch (e) {
+      // ignore close errors
+    }
+    console.log('[USB_freeD] Serial disconnected');
+    updatePanel();
+  }
+
+  function sendTargetPacket(quat) {
+    if (!serialConnected || !serialWriter || !quat) return;
+
+    // Pack as: [0xBB][qw float32 LE][qx][qy][qz][seq uint8][checksum XOR bytes 1..17]
+    const buf = new ArrayBuffer(TARGET_PACKET_SIZE);
+    const view = new DataView(buf);
+    view.setUint8(0, TARGET_HEADER);
+    view.setFloat32(1, quat.w, true);   // little-endian
+    view.setFloat32(5, quat.x, true);
+    view.setFloat32(9, quat.y, true);
+    view.setFloat32(13, quat.z, true);
+    view.setUint8(17, serialSeq & 0xFF);
+
+    // Checksum: XOR of bytes 1..17
+    let cs = 0;
+    const bytes = new Uint8Array(buf);
+    for (let i = 1; i < TARGET_PACKET_SIZE - 1; i++) cs ^= bytes[i];
+    view.setUint8(18, cs);
+
+    serialSeq = (serialSeq + 1) & 0xFF;
+
+    // Fire-and-forget: write is async but we don't await to avoid blocking the tick loop
+    serialWriter.write(bytes).catch((e) => {
+      console.warn('[USB_freeD] serial write failed:', e);
+      serialConnected = false;
+      serialWriter = null;
+      updatePanel();
+    });
+  }
+
   function publishOrientation(nowMs) {
     if (!observerQuat) return;
     if ((nowMs - observerLastPublishMs) < 30) return;
@@ -1152,6 +1316,11 @@
     window.__usbFreeDLastOrientation = payload;
     window.dispatchEvent(new CustomEvent('orientation:update', { detail: payload }));
     observerLastPublishMs = nowMs;
+
+    // Stream to receiver over Web Serial for closed-loop feedback
+    if (serialConnected && !payload.stale) {
+      sendTargetPacket(observerQuat);
+    }
   }
 
   function inWidgetZone(rect) {
@@ -2233,17 +2402,53 @@
       observerDebug = 'watcher disabled';
       return;
     }
-    if (nowMs - observerLastScanMs < SCAN_INTERVAL_MS) return;
 
+    // Fast path: if already locked on a WebGL source, read its matrix directly
+    // at the tick rate without doing full candidate collection/CSS scan.
+    const lockedFastPath = !!webglState.lockedId;
+    const scanIntervalMs = lockedFastPath ? SCAN_INTERVAL_LOCKED_MS : SCAN_INTERVAL_MS;
+    if (nowMs - observerLastScanMs < scanIntervalMs) return;
     observerLastScanMs = nowMs;
+
+    if (lockedFastPath) {
+      const locked = webglState.candidates.get(webglState.lockedId);
+      if (locked && locked.lastMatrix) {
+        const ageMs = nowMs - locked.lastSeenMs;
+        if (ageMs <= WEBGL_HOLD_MAX_MS) {
+          const rawQuat = matrix16ToQuat(locked.lastMatrix);
+          if (rawQuat) {
+            const quat = applyWebglConvention(rawQuat);
+            if (quat) {
+              const q = quatNormalize(quat);
+              if (q) {
+                const blend = Math.max(0.01, Math.min(0.9, config.smoothing));
+                observerRawQuat = observerRawQuat ? (quatLerp(observerRawQuat, q, blend) || q) : q;
+                observerQuat = applyFrameCalibration(observerRawQuat);
+                observerLastUpdateMs = nowMs;
+                publishOrientation(nowMs);
+                return;
+              }
+            }
+          }
+        }
+        // Locked candidate gone stale — fall through to full scan
+      }
+    }
 
     const info = collectWidgetCandidates();
     const candidates = info.candidates;
     const mode = normalizeFallbackMode(config.fallbackMode);
 
+    // Always extract CSS/DOM matrix first as an independent reference for WebGL bootstrap.
+    // If CSS succeeds it breaks the circular self-confirmation that causes wrong initial lock.
+    const cssCandidate = (mode !== 'semantic') ? extractFromCssMatrix(candidates, info.anchor) : null;
+    if (cssCandidate && cssCandidate.quat) {
+      cssReferenceQuat = quatNormalize(cssCandidate.quat);
+    }
+
     let sample = extractFromWebglUniform(info.anchor, nowMs);
     if (!sample && mode !== 'semantic') {
-      sample = extractFromCssMatrix(candidates, info.anchor);
+      sample = cssCandidate;
     }
 
     let labels = null;
@@ -2343,26 +2548,12 @@
         <div class="usb-freed-row">
           <button id="usb-freed-watch-toggle" class="usb-freed-btn usb-freed-btn-sm">Watcher ON</button>
           <button id="usb-freed-watch-fallback" class="usb-freed-btn usb-freed-btn-sm">Secondary: Auto</button>
+          <button id="usb-freed-serial-btn" class="usb-freed-btn usb-freed-btn-sm">Serial: OFF</button>
         </div>
 
         <div class="usb-freed-row">
           <label class="usb-freed-label">Source</label>
           <select id="usb-freed-source-select" class="usb-freed-select"></select>
-        </div>
-
-        <div class="usb-freed-row">
-          <label class="usb-freed-label">Input</label>
-          <select id="usb-freed-convention" class="usb-freed-select">
-            <option value="auto">Auto</option>
-            <option value="raw">Raw</option>
-            <option value="inverse">Inverse</option>
-          </select>
-        </div>
-
-        <div class="usb-freed-row">
-          <label class="usb-freed-label">Smooth</label>
-          <input id="usb-freed-watch-smooth" type="range" min="5" max="95" value="${Math.round(config.smoothing * 100)}" class="usb-freed-slider">
-          <span id="usb-freed-watch-smooth-val" class="usb-freed-label">${Math.round(config.smoothing * 100)}%</span>
         </div>
 
         <div class="usb-freed-preview-wrap">
@@ -2374,8 +2565,6 @@
           <button id="usb-freed-cal-reset" class="usb-freed-btn usb-freed-btn-sm">Clear Align</button>
         </div>
 
-        <div id="usb-freed-watch-status" class="usb-freed-status">Searching widget...</div>
-        <div id="usb-freed-watch-data" class="usb-freed-data">No orientation sample yet.</div>
         <div id="usb-freed-watch-note" class="usb-freed-hint">Upper-right view widget watcher is active.</div>
       </div>
     `;
@@ -2384,16 +2573,12 @@
 
     toggleBtn = panel.querySelector('#usb-freed-watch-toggle');
     fallbackBtn = panel.querySelector('#usb-freed-watch-fallback');
+    serialBtn = panel.querySelector('#usb-freed-serial-btn');
     sourceSelect = panel.querySelector('#usb-freed-source-select');
-    conventionSelect = panel.querySelector('#usb-freed-convention');
-    smoothSlider = panel.querySelector('#usb-freed-watch-smooth');
-    smoothVal = panel.querySelector('#usb-freed-watch-smooth-val');
     calibrateBtn = panel.querySelector('#usb-freed-cal-front');
     clearCalBtn = panel.querySelector('#usb-freed-cal-reset');
     previewCanvas = panel.querySelector('#usb-freed-preview');
     previewCtx = previewCanvas ? previewCanvas.getContext('2d') : null;
-    statusEl = panel.querySelector('#usb-freed-watch-status');
-    dataEl = panel.querySelector('#usb-freed-watch-data');
     noteEl = panel.querySelector('#usb-freed-watch-note');
 
     const minimizeBtn = panel.querySelector('.usb-freed-minimize');
@@ -2404,6 +2589,7 @@
       if (!config.watcherEnabled) {
         observerRawQuat = null;
         observerQuat = null;
+        cssReferenceQuat = null;
         observerConfidence = 0;
         observerStrategy = 'disabled';
       }
@@ -2420,6 +2606,10 @@
       updatePanel();
     });
 
+    serialBtn.addEventListener('click', () => {
+      connectSerial();
+    });
+
     sourceSelect.addEventListener('change', () => {
       const chosen = sourceSelect.value;
       if (!chosen) {
@@ -2433,19 +2623,6 @@
       }
       resetWebglLock();
       updatePanel();
-    });
-
-    conventionSelect.addEventListener('change', () => {
-      config.webglConvention = normalizeWebglConvention(conventionSelect.value);
-      saveConfig();
-      webglState.convention = null;
-      updatePanel();
-    });
-
-    smoothSlider.addEventListener('input', () => {
-      config.smoothing = parseInt(smoothSlider.value, 10) / 100;
-      smoothVal.textContent = Math.round(config.smoothing * 100) + '%';
-      saveConfig();
     });
 
     calibrateBtn.addEventListener('click', () => {
@@ -2477,18 +2654,17 @@
     toggleBtn.textContent = config.watcherEnabled ? 'Watcher ON' : 'Watcher OFF';
     toggleBtn.classList.toggle('usb-freed-btn-active', config.watcherEnabled);
     fallbackBtn.textContent = fallbackModeLabel(config.fallbackMode);
+    serialBtn.textContent = serialConnected ? 'Serial: ON' : 'Serial: OFF';
+    serialBtn.classList.toggle('usb-freed-btn-active', serialConnected);
     refreshSourceControls(performance.now());
     sourceSelect.disabled = !config.watcherEnabled;
-    conventionSelect.disabled = !config.watcherEnabled;
     const calOn = calibrationEnabled();
     clearCalBtn.classList.toggle('usb-freed-btn-active', calOn);
 
     const nowMs = performance.now();
+    const serialSuffix = serialConnected ? ' | serial: ON' : '';
     if (!config.watcherEnabled) {
-      statusEl.textContent = 'Watcher disabled';
-      statusEl.style.color = '#f9c97a';
-      dataEl.textContent = 'No orientation sample yet.';
-      noteEl.textContent = 'Enable watcher to resume sampling.';
+      noteEl.textContent = 'Watcher disabled.';
       calibrateBtn.disabled = true;
       clearCalBtn.disabled = !calOn;
       drawOrientationPreview(null, true);
@@ -2499,45 +2675,16 @@
     const ageMs = observerLastUpdateMs > 0 ? Math.round(nowMs - observerLastUpdateMs) : 0;
 
     if (!observerQuat || stale) {
-      statusEl.textContent = 'Searching for view widget...';
-      statusEl.style.color = '#f9c97a';
       calibrateBtn.disabled = true;
       clearCalBtn.disabled = !calOn;
-      dataEl.textContent =
-        'Strategy: ' + observerStrategy + '\n' +
-        'Align: ' + (calOn ? 'ON' : 'OFF') + '\n' +
-        'Confidence: ' + Math.round(observerConfidence * 100) + '%\n' +
-        'Yaw/Pitch/Roll: -- / -- / --\n' +
-        'Quat: --';
-      noteEl.textContent = observerDebug + (observerLastUpdateMs ? (' | last sample ' + ageMs + 'ms ago') : '');
+      noteEl.textContent = observerDebug + (observerLastUpdateMs ? (' | last sample ' + ageMs + 'ms ago') : '') + serialSuffix;
       drawOrientationPreview(observerQuat, true);
       return;
     }
 
-    const e = quatToEuler(observerQuat);
-    const yawDeg = e.yaw * 180 / Math.PI;
-    const pitchDeg = e.pitch * 180 / Math.PI;
-    const rollDeg = e.roll * 180 / Math.PI;
-
     calibrateBtn.disabled = false;
     clearCalBtn.disabled = !calOn;
-
-    statusEl.textContent = 'Widget tracked (' + observerStrategy + ')';
-    statusEl.style.color = observerConfidence >= 0.75 ? '#4ade80' : '#f9c97a';
-
-    dataEl.textContent =
-      'Strategy: ' + observerStrategy + '\n' +
-      'Align: ' + (calOn ? 'ON' : 'OFF') + '\n' +
-      'Confidence: ' + Math.round(observerConfidence * 100) + '%\n' +
-      'Yaw/Pitch/Roll: ' +
-      yawDeg.toFixed(1) + ' / ' + pitchDeg.toFixed(1) + ' / ' + rollDeg.toFixed(1) + ' deg\n' +
-      'Quat: ' +
-      observerQuat.w.toFixed(4) + ' ' +
-      observerQuat.x.toFixed(4) + ' ' +
-      observerQuat.y.toFixed(4) + ' ' +
-      observerQuat.z.toFixed(4);
-
-    noteEl.textContent = observerDebug + ' | sample age ' + ageMs + 'ms';
+    noteEl.textContent = observerDebug + ' | sample age ' + ageMs + 'ms' + serialSuffix;
     drawOrientationPreview(observerQuat, false);
   }
 
@@ -2577,6 +2724,7 @@
         calibration: getCalibrationQuat(),
         webglConvention: normalizeWebglConvention(config.webglConvention),
         lockedWebglSourceId: webglState.lockedId,
+        pinnedWebglLocId: webglState.pinnedLocId,
         preferredWebglSource: config.preferredWebglSource,
         lastOrientation: window.__usbFreeDLastOrientation || null,
         lastError: observerLastError,
@@ -2603,8 +2751,11 @@
       relockWebglSource: () => resetWebglLock(),
       calibrateCurrentAsFront: () => calibrateCurrentAsFront(),
       clearCalibration: () => clearCalibration(),
+      connectSerial: () => connectSerial(),
+      disconnectSerial: () => disconnectSerial(),
+      getSerialState: () => ({ connected: serialConnected, seq: serialSeq }),
     };
-    window.setInterval(tick, 80);
+    window.setInterval(tick, 30);
     tick();
     console.log('[USB_freeD] Widget watcher loaded (' + BUILD_TAG + ') on', window.location.hostname);
   }

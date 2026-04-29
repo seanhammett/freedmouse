@@ -9,8 +9,10 @@
 #include <esp_now.h>
 #include <USB.h>
 #include <USBHID.h>
+#include <USBCDC.h>
 #include <freertos/FreeRTOS.h>
 #include "espnow_packet.h"
+#include "target_packet.h"
 
 // =================== HID REPORT DESCRIPTOR ===================
 // Matches 3DConnexion SpaceMouse: multi-axis controller
@@ -78,10 +80,14 @@ public:
 };
 
 // =================== CONFIG ===================
-static const float ABS_ROT_SCALE = 8000.0f;  // error (rad) → SpaceMouse units; saturates at 350 (≈4° error),
-                                              // then proportional. Higher = faster slew, larger deadband.
-static const float DEADZONE_RAD  = 0.005f;  // error magnitude (rad) below which no correction is sent (~0.3°)
-static const float SMOOTH_ALPHA  = 0.75f;   // EMA on error velocity (higher = more responsive, less smooth)
+static const float MAX_STEP_RAD        = 0.050f;  // max angular velocity per frame (rad/10ms = 5 rad/s ~= 286 deg/s).
+                                                   // Caps how far Onshape can be commanded per serial window.
+                                                   // Increase for faster response, decrease if overshoot persists.
+static const float CONVERGENCE_ZONE_RAD = 0.050f; // ~2.9 deg. When error < this AND not growing, suppress command.
+                                                   // Prevents piling up commands while Onshape is already arriving.
+static const float ABS_ROT_SCALE = 350.0f / MAX_STEP_RAD;  // maps MAX_STEP_RAD -> full HID (350 units).
+static const float DEADZONE_RAD  = 0.030f;   // error magnitude below which no correction sent (~1.7 deg).
+static const float SMOOTH_ALPHA  = 0.28f;    // EMA on error velocity. Lower = more damping.
 static const unsigned long IDLE_TIMEOUT_MS = 80;  // zero-out HID after no packets
 static const float INVERT_ROLL  = -1.0f;   // set to -1.0f to invert roll  (Rx)
 static const float INVERT_PITCH =  1.0f;   // set to -1.0f to invert pitch (Ry / Onshape X)
@@ -93,6 +99,7 @@ static const uint8_t RGB_LED_PIN = 48;
 // =================== GLOBALS ===================
 USBHID        usbHID;
 SpaceMouseHID smDevice;
+USBCDC        USBSerial;  // CDC-ACM interface — composite with HID, same cable
 
 // Heartbeat state
 unsigned long lastHeartbeatMs = 0;
@@ -121,13 +128,24 @@ uint32_t outOfOrderPacketCount = 0;
 
 // Home: device orientation at last tap (physical reference frame)
 float qHomeW = 1.0f, qHomeX = 0.0f, qHomeY = 0.0f, qHomeZ = 0.0f;
-// View: receiver's running estimate of Onshape's current orientation
+// View: receiver's running estimate of Onshape's current orientation.
+// Anchored to ground truth by serial packets from the extension; dead-reckoned between.
 float qViewW = 1.0f, qViewX = 0.0f, qViewY = 0.0f, qViewZ = 0.0f;
 bool hasHome = false;
 bool motionActive = false;
 
+// =================== SERIAL TARGET PACKET (extension → receiver) ===================
+static uint8_t  tgtBuf[TARGET_PACKET_SIZE];
+static uint8_t  tgtBufIdx = 0;
+static unsigned long lastTargetMs = 0;  // millis() of last valid target packet
+static bool     hasTargetLock = false;  // true once we've received at least one valid packet
+static bool     newSerialPacketReady = false;  // set by processSerialInput, consumed by loop()
+static uint8_t  lastTargetSeq = 0;
+static bool     hasLastTargetSeq = false;
+
 // Smoothed error angular velocity (EMA filtered)
 float smoothRx = 0.0f, smoothRy = 0.0f, smoothRz = 0.0f;
+float prevSmoothMag = 0.0f;  // previous frame's smoothed error magnitude (convergence detection)
 
 // =================== QUATERNION MATH ===================
 void quatDelta(float cw, float cx, float cy, float cz,
@@ -179,6 +197,28 @@ void quatMul(float aw, float ax, float ay, float az,
     rx = aw*bx + ax*bw + ay*bz - az*by;
     ry = aw*by - ax*bz + ay*bw + az*bx;
     rz = aw*bz + ax*by - ay*bx + az*bw;
+}
+
+// Spherical linear interpolation between two unit quaternions (shortest path)
+void quatSlerp(float aw, float ax, float ay, float az,
+               float bw, float bx, float by, float bz,
+               float t,
+               float& rw, float& rx, float& ry, float& rz) {
+    float dot = aw*bw + ax*bx + ay*by + az*bz;
+    if (dot < 0.0f) { bw=-bw; bx=-bx; by=-by; bz=-bz; dot=-dot; }  // shortest arc
+    if (dot > 0.9995f) {
+        // Nearly identical quaternions -- use nlerp to avoid arccos instability
+        rw = aw + t*(bw-aw); rx = ax + t*(bx-ax);
+        ry = ay + t*(by-ay); rz = az + t*(bz-az);
+    } else {
+        float theta0    = acosf(dot);
+        float sinTheta0 = sinf(theta0);
+        float s0 = sinf((1.0f - t) * theta0) / sinTheta0;
+        float s1 = sinf(t           * theta0) / sinTheta0;
+        rw = s0*aw + s1*bw; rx = s0*ax + s1*bx;
+        ry = s0*ay + s1*by; rz = s0*az + s1*bz;
+    }
+    quatNorm(rw, rx, ry, rz);
 }
 
 // Convert angular velocity (rad/frame) to a step quaternion
@@ -246,6 +286,51 @@ void updateHeartbeat() {
     neopixelWrite(RGB_LED_PIN, 0, brightness, 0);
 }
 
+// =================== SERIAL TARGET PACKET PARSER ===================
+// Reads all buffered Serial bytes, syncs on TARGET_HEADER (0xBB), accumulates
+// TARGET_PACKET_SIZE bytes, verifies checksum, then anchors qView.
+void processSerialInput() {
+    while (USBSerial.available() > 0) {
+        uint8_t b = (uint8_t)USBSerial.read();
+
+        // If not yet started, wait for header byte
+        if (tgtBufIdx == 0) {
+            if (b != TARGET_HEADER) continue;
+        }
+
+        tgtBuf[tgtBufIdx++] = b;
+
+        if (tgtBufIdx < TARGET_PACKET_SIZE) continue;
+
+        // Full packet accumulated — verify
+        tgtBufIdx = 0;
+        const TargetPacket* pkt = reinterpret_cast<const TargetPacket*>(tgtBuf);
+        if (!verifyTargetPacket(*pkt)) {
+            // Bad checksum — could be mid-stream sync; scan for next header
+            continue;
+        }
+
+        // Valid packet: hard-set qView to the actual Onshape orientation.
+        // No slerp blending — we rely on the serial-gate + rate-limit in loop()
+        // to prevent overshoot rather than smoothing the ground-truth reference.
+        const unsigned long nowMs = millis();
+        qViewW = pkt->qw; qViewX = pkt->qx; qViewY = pkt->qy; qViewZ = pkt->qz;
+        quatNorm(qViewW, qViewX, qViewY, qViewZ);
+        lastTargetMs = nowMs;
+        hasTargetLock = true;
+        newSerialPacketReady = true;  // gates HID command in loop()
+
+        if (hasLastTargetSeq) {
+            int8_t seqDelta = (int8_t)(pkt->seq - (uint8_t)(lastTargetSeq + 1));
+            if (seqDelta > 0) {
+                // Dropped target packet — not critical, qView still updated
+            }
+        }
+        lastTargetSeq = pkt->seq;
+        hasLastTargetSeq = true;
+    }
+}
+
 // =================== ESP-NOW CALLBACK ===================
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     if (len != sizeof(ImuEspNowPacket)) return;
@@ -268,18 +353,16 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 
 // =================== SETUP ===================
 void setup() {
-    Serial.begin(115200);  // debug output over USB CDC (separate from HID)
-
-    Serial.println("\n=== USB_freeD — ESP-NOW Receiver + SpaceMouse HID ===");
-    Serial.printf("[INFO] Receiver MAC: %s\n", WiFi.macAddress().c_str());
-
-    // --- USB HID as SpaceMouse ---
+    // --- USB composite device: HID (SpaceMouse) + CDC-ACM (serial) ---
+    // VID/PID must be set before USB.begin(); with ARDUINO_USB_CDC_ON_BOOT=0
+    // the framework never calls USB.begin() automatically, so we control it here.
     USB.VID(0x256F);                          // 3Dconnexion vendor ID
     USB.PID(0xC631);                          // SpaceMouse Pro Wireless
     USB.productName("SpaceMouse Pro Wireless");
     USB.manufacturerName("3Dconnexion");
 
     usbHID.addDevice(&smDevice, sizeof(SM_REPORT_DESC));
+    USBSerial.begin(115200);  // registers CDC interface before USB.begin()
     USB.begin();
     usbHID.begin();
 
@@ -290,22 +373,25 @@ void setup() {
     WiFi.disconnect();
     delay(100);
 
-    Serial.println("\n=== USB_freeD — ESP-NOW Receiver + SpaceMouse HID ===");
-    Serial.printf("[INFO] Receiver MAC: %s\n", WiFi.macAddress().c_str());
+    USBSerial.println("\n=== USB_freeD — ESP-NOW Receiver + SpaceMouse HID ===");
+    USBSerial.printf("[INFO] Receiver MAC: %s\n", WiFi.macAddress().c_str());
 
     if (esp_now_init() != ESP_OK) {
-        Serial.println("[FAIL] ESP-NOW init failed!");
+        USBSerial.println("[FAIL] ESP-NOW init failed!");
         while (true) delay(1000);
     }
 
     esp_now_register_recv_cb(onDataRecv);
 
-    Serial.println("[OK] ESP-NOW ready — waiting for IMU data...");
-    Serial.println("[OK] USB HID SpaceMouse ready");
+    USBSerial.println("[OK] ESP-NOW ready — waiting for IMU data...");
+    USBSerial.println("[OK] USB HID SpaceMouse ready");
 }
 
 // =================== MAIN LOOP ===================
 void loop() {
+    // Always drain serial first — anchors qView before IMU error calculation
+    processSerialInput();
+
     RxSample sample;
     if (popLatestSample(sample)) {
         // Snapshot latest received data
@@ -335,7 +421,11 @@ void loop() {
             // at the desired reference orientation before tapping.
             if ((flags & ENOW_FLAG_TAP) || !hasHome) {
                 qHomeW = qw; qHomeX = qx; qHomeY = qy; qHomeZ = qz;
-                qViewW = 1.0f; qViewX = 0.0f; qViewY = 0.0f; qViewZ = 0.0f;
+                // Only reset qView to identity if no extension ground-truth is active.
+                // If serial is connected, qView will be overwritten on the next packet anyway.
+                if (!hasTargetLock) {
+                    qViewW = 1.0f; qViewX = 0.0f; qViewY = 0.0f; qViewZ = 0.0f;
+                }
                 smoothRx = smoothRy = smoothRz = 0.0f;
                 hasHome = true;
                 sendZero();
@@ -370,23 +460,59 @@ void loop() {
         smoothRy = SMOOTH_ALPHA * ry + (1.0f - SMOOTH_ALPHA) * smoothRy;
         smoothRz = SMOOTH_ALPHA * rz + (1.0f - SMOOTH_ALPHA) * smoothRz;
 
-        // Apply axis inversions and quantize/clamp to the exact HID command we send.
-        int16_t smRx = toSM(INVERT_ROLL  * smoothRx);
-        int16_t smRy = toSM(INVERT_PITCH * smoothRy);
-        int16_t smRz = toSM(INVERT_YAW   * smoothRz);
+        const float smoothMag = sqrtf(smoothRx*smoothRx + smoothRy*smoothRy + smoothRz*smoothRz);
 
-        // Integrate qView from the exact command after clamp/quantization.
-        // Mapping back through INVERT_* keeps qView in the same physical frame as qTarget.
-        float cmdRx = INVERT_ROLL  * ((float)smRx / ABS_ROT_SCALE);
-        float cmdRy = INVERT_PITCH * ((float)smRy / ABS_ROT_SCALE);
-        float cmdRz = INVERT_YAW   * ((float)smRz / ABS_ROT_SCALE);
+        // === OPTION 3: Rate-limit + convergence suppression ===
+        //
+        // When serial is active, gate HID commands: only fire when a new serial packet
+        // has arrived (newSerialPacketReady). This ensures at most one command is issued
+        // per Onshape observation, preventing multiple commands piling up during the
+        // ~100ms render latency window that cause oscillation.
+        //
+        // Also suppress if within the convergence zone and error is not growing —
+        // Onshape is already arriving; adding more commands would overshoot.
+        //
+        // When serial is NOT active (open loop), fire every IMU frame as before.
 
-        float stepW, stepX, stepY, stepZ;
-        angVelToQuat(cmdRx, cmdRy, cmdRz, stepW, stepX, stepY, stepZ);
-        float nVW, nVX, nVY, nVZ;
-        quatMul(stepW, stepX, stepY, stepZ, qViewW, qViewX, qViewY, qViewZ, nVW, nVX, nVY, nVZ);
-        qViewW = nVW; qViewX = nVX; qViewY = nVY; qViewZ = nVZ;
-        quatNorm(qViewW, qViewX, qViewY, qViewZ);
+        bool converging = hasTargetLock &&
+                          (smoothMag < CONVERGENCE_ZONE_RAD) &&
+                          (smoothMag <= prevSmoothMag * 1.10f);  // 10% tolerance for noise
+        prevSmoothMag = smoothMag;
+
+        // Consume the gate flag regardless — ensures we always re-evaluate on next serial packet
+        const bool newPacket = newSerialPacketReady;
+        newSerialPacketReady = false;
+
+        const bool shouldSendHid = !hasTargetLock || (newPacket && !converging);
+
+        // Rate-limit: scale the velocity vector down uniformly if magnitude exceeds MAX_STEP_RAD.
+        // Preserves axis ratios so the rotation direction is exact, only speed is capped.
+        float ratioScale = 1.0f;
+        if (smoothMag > MAX_STEP_RAD && smoothMag > 1e-9f) {
+            ratioScale = MAX_STEP_RAD / smoothMag;
+        }
+
+        int16_t smRx = 0, smRy = 0, smRz = 0;
+        if (shouldSendHid) {
+            smRx = toSM(INVERT_ROLL  * smoothRx * ratioScale);
+            smRy = toSM(INVERT_PITCH * smoothRy * ratioScale);
+            smRz = toSM(INVERT_YAW   * smoothRz * ratioScale);
+        }
+
+        // qView dead-reckoning: only when serial is NOT active.
+        // With serial active, qView is set directly from ground truth each packet;
+        // dead-reckoning would corrupt it between updates.
+        if (!hasTargetLock && (smRx != 0 || smRy != 0 || smRz != 0)) {
+            float cmdRx = INVERT_ROLL  * ((float)smRx / ABS_ROT_SCALE);
+            float cmdRy = INVERT_PITCH * ((float)smRy / ABS_ROT_SCALE);
+            float cmdRz = INVERT_YAW   * ((float)smRz / ABS_ROT_SCALE);
+            float stepW, stepX, stepY, stepZ;
+            angVelToQuat(cmdRx, cmdRy, cmdRz, stepW, stepX, stepY, stepZ);
+            float nVW, nVX, nVY, nVZ;
+            quatMul(stepW, stepX, stepY, stepZ, qViewW, qViewX, qViewY, qViewZ, nVW, nVX, nVY, nVZ);
+            qViewW = nVW; qViewX = nVX; qViewY = nVY; qViewZ = nVZ;
+            quatNorm(qViewW, qViewX, qViewY, qViewZ);
+        }
 
             if (smRx != 0 || smRy != 0 || smRz != 0) {
                 sendTranslation(0, 0, 0);
