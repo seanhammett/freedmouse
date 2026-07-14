@@ -17,7 +17,8 @@ static const uint8_t STATUS_LED_FLASH_BRIGHTNESS = 1;
 
 // Broadcast address — receiver must be in promiscuous mode or paired
 // To pair with a specific receiver, replace with its MAC address
-static uint8_t receiverMAC[] = {0xE4, 0xB0, 0x63, 0xAE, 0xBA, 0xF8}; // MAC: E4:B0:63:AE:BA:F8
+// static uint8_t receiverMAC[] = {0xE4, 0xB0, 0x63, 0xAE, 0xBA, 0xF8}; // old nano MAC: E4:B0:63:AE:BA:F8
+static uint8_t receiverMAC[] = {0x7C, 0xDF, 0xA1, 0xFB, 0x25, 0xC0}; // esp32-s3-devkitc-1 MAC: 7C:DF:A1:FB:25:C0
 
 // =================== GLOBALS ===================
 CodeCell myCodeCell;

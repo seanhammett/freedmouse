@@ -1,4 +1,4 @@
-// USB_freeD — ESP-NOW Receiver + SpaceMouse HID (Arduino Nano ESP32 / S3)
+// USB_freeD — ESP-NOW Receiver + SpaceMouse HID (ESP32-S3-DevKitC-1, WROOM-2)
 // Receives quaternion data over ESP-NOW, converts to angular velocity,
 // and presents as a 3DConnexion SpaceMouse Pro Wireless over USB HID.
 //
@@ -93,7 +93,7 @@ static const float INVERT_ROLL  = -1.0f;   // set to -1.0f to invert roll  (Rx)
 static const float INVERT_PITCH =  1.0f;   // set to -1.0f to invert pitch (Ry / Onshape X)
 static const float INVERT_YAW   = -1.0f;   // set to -1.0f to invert yaw   (Rz / Onshape Z)
 
-// RGB LED heartbeat (Arduino Nano ESP32 built-in NeoPixel on GPIO48)
+// RGB LED heartbeat (ESP32-S3-DevKitC-1 built-in WS2812B NeoPixel on GPIO 48)
 static const uint8_t RGB_LED_PIN = 48;
 
 // =================== GLOBALS ===================
@@ -146,6 +146,14 @@ static bool     hasLastTargetSeq = false;
 // Smoothed error angular velocity (EMA filtered)
 float smoothRx = 0.0f, smoothRy = 0.0f, smoothRz = 0.0f;
 float prevSmoothMag = 0.0f;  // previous frame's smoothed error magnitude (convergence detection)
+
+// Feedforward: angular velocity from sender quaternion derivative (rad/s, LPF'd).
+// Bypasses closed-loop dead time for the dominant motion command.
+float qDevPrevW = 1.0f, qDevPrevX = 0.0f, qDevPrevY = 0.0f, qDevPrevZ = 0.0f;
+unsigned long tDevPrevMs = 0;
+bool hasDevPrev = false;
+float omegaFFx = 0.0f, omegaFFy = 0.0f, omegaFFz = 0.0f;
+static const float FF_LPF_ALPHA = 0.5f;  // single-pole low-pass on FF (kills BNO085 quantization)
 
 // =================== QUATERNION MATH ===================
 void quatDelta(float cw, float cx, float cy, float cz,
@@ -427,11 +435,44 @@ void loop() {
                     qViewW = 1.0f; qViewX = 0.0f; qViewY = 0.0f; qViewZ = 0.0f;
                 }
                 smoothRx = smoothRy = smoothRz = 0.0f;
+                // Reset FF state — re-anchoring at home is a discontinuity in q_device
+                hasDevPrev = false;
+                omegaFFx = omegaFFy = omegaFFz = 0.0f;
                 hasHome = true;
                 sendZero();
                 motionActive = false;
                 return;
             }
+
+        // === Feedforward: differentiate sender quaternion to get ω_dev (rad/s) ===
+        // Open-loop, ~5-10 ms latency, immune to round-trip dead time.
+        // Step 1 of staged rollout: compute and log only — does not yet affect HID output.
+        const unsigned long sampleMs = sample.recvMs;
+        if (hasDevPrev) {
+            float dtFF = (sampleMs - tDevPrevMs) * 1e-3f;
+            if (dtFF > 0.001f && dtFF < 0.1f) {  // sanity-bound dt
+                float dW, dX, dY, dZ;
+                quatDelta(qw, qx, qy, qz, qDevPrevW, qDevPrevX, qDevPrevY, qDevPrevZ, dW, dX, dY, dZ);
+                quatNorm(dW, dX, dY, dZ);
+                float ffx, ffy, ffz;
+                deltaToAngVel(dW, dX, dY, dZ, ffx, ffy, ffz);  // radians, this frame
+                ffx /= dtFF; ffy /= dtFF; ffz /= dtFF;          // → rad/s
+                omegaFFx = FF_LPF_ALPHA * ffx + (1.0f - FF_LPF_ALPHA) * omegaFFx;
+                omegaFFy = FF_LPF_ALPHA * ffy + (1.0f - FF_LPF_ALPHA) * omegaFFy;
+                omegaFFz = FF_LPF_ALPHA * ffz + (1.0f - FF_LPF_ALPHA) * omegaFFz;
+            }
+        }
+        qDevPrevW = qw; qDevPrevX = qx; qDevPrevY = qy; qDevPrevZ = qz;
+        tDevPrevMs = sampleMs;
+        hasDevPrev = true;
+
+        // 20 Hz FF diagnostic — comment out once verified
+        static unsigned long lastFFLogMs = 0;
+        if (sampleMs - lastFFLogMs >= 50) {
+            lastFFLogMs = sampleMs;
+            USBSerial.printf("[FF] wx=%+.2f wy=%+.2f wz=%+.2f rad/s\n",
+                             omegaFFx, omegaFFy, omegaFFz);
+        }
 
         // Target: device orientation relative to home reference
         // qTarget = qDevice * conj(qHome)
