@@ -8,7 +8,7 @@
   const STORAGE_KEY = 'usbFreeDWidgetWatcherConfig';
   const SCAN_INTERVAL_MS = 220;
   const STALE_MS = 1600;
-  const BUILD_TAG = 'watcher-2026-04-23-webgl-primary';
+  const BUILD_TAG = 'watcher-2026-07-16c-frozen-takeover';
   const WEBGL_ORTHO_ERR_MAX = 0.3;
   const WEBGL_CHANGE_EPS = 0.00055;
   const WEBGL_CANDIDATE_TTL_MS = 2600;
@@ -18,12 +18,49 @@
   const WEBGL_MIN_CHANGES = 6;
   const WEBGL_SWITCH_MARGIN = 220;
   const WEBGL_SWITCH_RATIO = 1.28;
-  // Preferred locId hints tried first on each page load (before scored auto-selection).
-  // locIds are assigned by WebGL encounter order, which is deterministic for Onshape.
-  const WEBGL_DEFAULT_LOC_HINTS = ['u_6', 'u_7'];
+  // Motion-signature gates, derived from a real capture of every stream on an
+  // Onshape session (tests/fixtures/diag-mac-2026-07-15.json). There, ALL 21
+  // rotation streams were named uMVMatrix, so names cannot disambiguate. The
+  // camera cluster is identified by physics instead: it changes ~once per
+  // frame in small smooth steps (~3°/change during a fast orbit) and never
+  // carries identity writes. Per-object multiplexed streams jump 65°+ between
+  // draw calls and interleave identity overlay passes; settle-only overlay
+  // streams change a handful of times per minute, always in large snaps.
+  const WEBGL_JUMP_STEP_DEG = 20;        // a per-change step above this counts as a "jump"
+  const WEBGL_JUMP_FRAC_MAX = 0.3;       // reject when most steps are jumps (per-object stream)
+  const WEBGL_ID_FRAC_MAX = 0.05;        // reject streams that carry identity overlay writes
+  const WEBGL_SIGNATURE_MIN_STEPS = 20;  // steps observed before the jump gate applies
+  const WEBGL_ID_MIN_CALLS = 30;         // calls observed before the identity gate applies
+  // Frozen-lock takeover: settle-only overlay streams (u_1-class in the field
+  // capture) keep RECEIVING uploads but only CHANGE when the view settles, so
+  // a lock on one looks healthy at rest and freezes during every drag. If the
+  // locked stream hasn't changed for this long while another qualified stream
+  // is changing at render rate, the moving stream takes the lock. This cannot
+  // flap: at rest nothing changes at high rate, and a correctly locked camera
+  // stream never freezes while anything else is moving.
+  const WEBGL_FROZEN_LOCK_MS = 1200;     // locked stream unchanged this long = frozen
+  const WEBGL_TAKEOVER_MIN_CHANGES = 8;  // challenger changes within its current 1s window
+  const WEBGL_TAKEOVER_FRESH_MS = 400;   // challenger's last change must be this recent
+  // Cross-validation of WebGL candidates against the CSS view-cube matrix.
+  // A candidate is only auto-lockable while a CSS reference exists if its
+  // orientation has agreed with the reference across several distinct view poses.
+  // CSS cross-check TELEMETRY ONLY. The CSS view-cube transform proved
+  // unreliable as ground truth (on some machines it only updates when the
+  // view settles, freezing mid-orbit), so it must never gate or unlock the
+  // WebGL stream selection. The metrics below are computed passively and
+  // surfaced in the dropdown/debug dumps to help identify the right stream.
+  const WEBGL_AGREE_MIN_SAMPLES = 3;      // distinct-pose samples before telemetry is shown as trusted
+  const WEBGL_AGREE_SAMPLE_MAX_AGE_MS = 250; // candidate matrix must be this fresh to compare
+  const CSS_REFERENCE_FRESH_MS = 10000;   // how long a CSS reference counts as fresh (display only)
+  const WEBGL_COROT_MIN = 0.7;            // co-rotation EMA shown as "validated" in telemetry
+  const CSS_REF_MOVE_DOT = 0.9999;        // ref must move ~1.6°+ for a new telemetry sample
   // Fast-path scan interval when a WebGL source is already locked.
   // Full candidate re-evaluation still uses SCAN_INTERVAL_MS.
+  // Note: the locked tick is only a heartbeat — actual publishing happens at
+  // render rate via push-mode (the uniform hook publishes on every change of
+  // the locked stream's matrix), capped by PUSH_MIN_INTERVAL_MS.
   const SCAN_INTERVAL_LOCKED_MS = 50;
+  const PUSH_MIN_INTERVAL_MS = 15;
   // Serial target packet: header byte must match target_packet.h TARGET_HEADER
   const TARGET_HEADER = 0xBB;
   const TARGET_PACKET_SIZE = 19;
@@ -40,9 +77,19 @@
   let observerLastPublishMs = 0;
   let observerLastError = null;
 
+  // Published-sample rate over a rolling 1s window, for the panel Hz readout.
+  let publishHz = 0;
+  let publishCountWindow = 0;
+  let publishWindowStartMs = 0;
+
   // CSS/DOM-derived orientation reference updated independently of the WebGL lock.
   // Used to bootstrap WebGL candidate scoring and break circular self-confirmation.
   let cssReferenceQuat = null;
+  let cssReferenceLastMs = 0;
+  // The DOM element the CSS reference was last read from. While a WebGL lock
+  // is held, telemetry re-reads just this element's computed transform
+  // (one getComputedStyle) instead of running the heavy full-document scan.
+  let cssReferenceEl = null;
 
   // =================== WEB SERIAL STATE ===================
   let serialPort = null;
@@ -55,6 +102,7 @@
   let statusEl = null;
   let dataEl = null;
   let noteEl = null;
+  let diagBtn = null;
   let toggleBtn = null;
   let fallbackBtn = null;
   let sourceSelect = null;
@@ -65,7 +113,14 @@
   let clearCalBtn = null;
   let previewCanvas = null;
   let previewCtx = null;
-  let sourceOptionsSignature = '';
+  // Next time the source dropdown may rebuild. Rebuilding involves candidate
+  // scoring and a layout-forcing anchor lookup, so it's time-throttled rather
+  // than run on every 30ms panel tick. 0 forces an immediate rebuild.
+  let sourceControlsNextRefreshMs = 0;
+  // True while the source <select> is focused/unfurled. Rebuilding a native
+  // select's options while its popup is open detaches the popup (it sticks to
+  // the screen and eats clicks), so all rebuilds are suspended until it closes.
+  let sourceSelectOpen = false;
 
   const webglState = {
     hooksInstalled: false,
@@ -652,7 +707,8 @@
       }
       return true;
     }
-    if (preferred.locHint && candidate.locId === preferred.locHint) return true;
+    // No locHint fallback: locIds are assigned by WebGL-call encounter order,
+    // so a saved locHint points at a RANDOM stream in any later session.
     return false;
   }
 
@@ -746,6 +802,75 @@
     return Math.max(rawDot, invDot);
   }
 
+  function cssReferenceFresh(nowMs) {
+    return !!cssReferenceQuat && cssReferenceLastMs > 0 && (nowMs - cssReferenceLastMs) < CSS_REFERENCE_FRESH_MS;
+  }
+
+  function candidateAgreement(c) {
+    if (!c || c.agreeSamples < WEBGL_AGREE_MIN_SAMPLES) return null;
+    return c.agreeEma;
+  }
+
+  // Offset-invariant validation metric; null until enough samples exist.
+  function candidateCoRotation(c) {
+    if (!c || c.coRotSamples < WEBGL_AGREE_MIN_SAMPLES) return null;
+    return c.coRotEma;
+  }
+
+  function candidateIsValidated(c) {
+    const co = candidateCoRotation(c);
+    return co !== null && co >= WEBGL_COROT_MIN;
+  }
+
+  // Compare every fresh WebGL candidate against the CSS view-cube reference.
+  // Samples only accrue when the reference has moved since the candidate's last
+  // sample, so static/identity matrices can't accumulate trivial agreement —
+  // only streams that actually track the orbiting view score highly.
+  //
+  // Two metrics per sample:
+  // - agreeEma: absolute |quat dot| match (raw or inverse). Used for ranking
+  //   and convention voting; only ~1.0 for the true view matrix.
+  // - coRotEma: does the candidate rotate by the same ANGLE the reference
+  //   rotated since the last sample? Invariant to fixed frame offsets, so it
+  //   validates camera-linked streams even when conventions differ.
+  function updateWebglAgreement(nowMs) {
+    const ref = cssReferenceQuat;
+    if (!ref) return;
+
+    for (const c of webglState.candidates.values()) {
+      if (!c.lastMatrix) continue;
+      if (nowMs - c.lastSeenMs > WEBGL_AGREE_SAMPLE_MAX_AGE_MS) continue;
+      if (c.lastAgreeRefQuat && Math.abs(quatDot(c.lastAgreeRefQuat, ref)) > CSS_REF_MOVE_DOT) continue;
+
+      const raw = matrix16ToQuat(c.lastMatrix);
+      if (!raw) continue;
+      const inv = quatConjugate(raw);
+      const rawDot = Math.abs(quatDot(raw, ref));
+      const invDot = inv ? Math.abs(quatDot(inv, ref)) : 0;
+      const agree = Math.max(rawDot, invDot);
+
+      if (invDot > rawDot) c.invWins += 1;
+      else c.rawWins += 1;
+
+      const k = 0.3;
+      c.agreeEma = c.agreeSamples === 0 ? agree : c.agreeEma * (1 - k) + agree * k;
+      c.agreeSamples += 1;
+
+      if (c.lastAgreeRefQuat && c.lastAgreeCandQuat) {
+        const dRef = 2 * Math.acos(Math.min(1, Math.abs(quatDot(c.lastAgreeRefQuat, ref))));
+        const dCand = 2 * Math.acos(Math.min(1, Math.abs(quatDot(c.lastAgreeCandQuat, raw))));
+        // 1 when rotation amounts match, 0 when candidate stood still or moved
+        // a completely different amount. dRef floor avoids noise blowup.
+        const coSample = 1 - Math.min(1, Math.abs(dCand - dRef) / Math.max(dRef, 0.035));
+        c.coRotEma = c.coRotSamples === 0 ? coSample : c.coRotEma * (1 - k) + coSample * k;
+        c.coRotSamples += 1;
+      }
+
+      c.lastAgreeRefQuat = { ...ref };
+      c.lastAgreeCandQuat = raw;
+    }
+  }
+
   function shouldSwitchWebglLock(current, challenger, anchor, nowMs) {
     if (!challenger) return false;
     if (!current) return true;
@@ -787,13 +912,30 @@
     }
   }
 
+  // Hard disqualifiers from the motion signature. Both are intrinsic to the
+  // stream (no CSS, no naming, no machine-specific hints) and both identify
+  // their class within a couple of frames of interaction.
+  function candidateDisqualified(c) {
+    if (c.calls >= WEBGL_ID_MIN_CALLS && c.idCalls / c.calls > WEBGL_ID_FRAC_MAX) return 'identity-writes';
+    if (c.stepCount >= WEBGL_SIGNATURE_MIN_STEPS && c.jumpCount / c.stepCount > WEBGL_JUMP_FRAC_MAX) return 'jumpy';
+    return null;
+  }
+
+  function candidateLooksSmooth(c) {
+    return c.stepCount >= WEBGL_SIGNATURE_MIN_STEPS
+      && c.idCalls === 0
+      && c.jumpCount / c.stepCount < 0.05;
+  }
+
   function scoreWebglCandidate(c, anchor) {
     const nowMs = performance.now();
     const ageMs = nowMs - c.lastSeenMs;
     if (ageMs > WEBGL_CANDIDATE_TTL_MS) return -Infinity;
     if (c.calls < WEBGL_MIN_CALLS || c.changes < WEBGL_MIN_CHANGES) return -Infinity;
+    if (candidateDisqualified(c)) return -Infinity;
 
     let score = c.changes * 1.2 + c.calls * 0.02;
+    if (candidateLooksSmooth(c)) score += 600;
     score -= c.avgErr * 240;
     score -= ageMs * 0.04;
 
@@ -810,6 +952,12 @@
       const continuity = candidateContinuityWithObserver(c);
       score += continuity * 145;
       if (continuity < 0.35) score -= 180;
+    }
+
+    const uname = (c.uniformName || '').toLowerCase();
+    if (uname) {
+      if (/view|camera|orient|rotat/.test(uname)) score += 90;
+      if (/proj|shadow|light|bone|skin|instance|clip|texture/.test(uname)) score -= 240;
     }
 
     if (preferredMatchesCandidate(c)) {
@@ -861,15 +1009,330 @@
     return rawQuat;
   }
 
-  function recordWebglMatrix(gl, location, value) {
+  // Render-rate publishing, deferred to end-of-frame. A uniform location is
+  // multiplexed across draw passes within one frame (Onshape writes identity
+  // for overlay passes and the camera matrix for the model pass to the SAME
+  // uniform), so publishing synchronously on every write flickers between
+  // identity and the real orientation. Instead, a change on the locked stream
+  // schedules ONE microtask, which runs after all of the frame's draw calls
+  // and publishes the settled frame-final value — the same value the old
+  // polling mode sampled, but with render-rate latency.
+  let pushScheduled = false;
+
+  function schedulePushPublish() {
+    if (pushScheduled) return;
+    pushScheduled = true;
+    queueMicrotask(() => {
+      pushScheduled = false;
+      try {
+        const locked = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
+        if (!locked || !locked.lastMatrix) return;
+        publishLockedPush(locked, performance.now());
+      } catch (e) {
+        setLastError('webgl.push', e, null);
+      }
+    });
+  }
+
+  function publishLockedPush(c, nowMs) {
+    if (!config.watcherEnabled) return;
+    if ((nowMs - observerLastPublishMs) < PUSH_MIN_INTERVAL_MS) return;
+
+    const rawQuat = matrix16ToQuat(c.lastMatrix);
+    if (!rawQuat) return;
+    const quat = applyWebglConvention(rawQuat);
+    const q = quatNormalize(quat);
+    if (!q) return;
+
+    if (!observerRawQuat) {
+      observerRawQuat = q;
+    } else {
+      const blend = Math.max(0.01, Math.min(0.9, config.smoothing));
+      observerRawQuat = quatLerp(observerRawQuat, q, blend) || q;
+    }
+    observerQuat = applyFrameCalibration(observerRawQuat);
+    observerStrategy = 'webgl-uniform-matrix4fv';
+    observerLastUpdateMs = nowMs;
+    publishOrientation(nowMs);
+  }
+
+  // -------------------------------------------------------------------------
+  // Diagnostic recorder. Captures EVERY mat4 uniform stream (binned rotation
+  // activity), pointer/wheel input, CSS view-cube samples, and lock changes
+  // for ~30s while the user follows a scripted gesture protocol. The dump is
+  // the ground truth for designing/regressing the stream selector offline —
+  // it replaces guessing at selection heuristics and asking the user to
+  // field-test each guess.
+  const DIAG_BIN_MS = 200;
+  const DIAG_PHASES = [
+    { untilS: 5, label: 'hands OFF (idle baseline)' },
+    { untilS: 15, label: 'ORBIT continuously (drag-rotate the model)' },
+    { untilS: 18, label: 'hands OFF' },
+    { untilS: 24, label: 'click FRONT on the view cube, then hands off' },
+    { untilS: 30, label: 'click TOP on the view cube, then hands off' },
+    { untilS: 999, label: 'done - hands off' },
+  ];
+  const DIAG_MAX_STREAMS = 300;
+  const diagState = {
+    active: false,
+    startMs: 0,
+    durationMs: 0,
+    finishedMs: 0,
+    resultNote: '',
+    streams: new Map(),
+    pointer: [],
+    css: [],
+    locks: [],
+    lastMoveT: -1000,
+    lastCssQuat: null,
+    lastLockedId: null,
+    listenersOn: false,
+  };
+  let lastDiagnostic = null;
+
+  function diagPhaseLabel(elapsedS) {
+    for (const p of DIAG_PHASES) if (elapsedS < p.untilS) return p.label;
+    return 'done';
+  }
+
+  function matrixIsIdentity16(m) {
+    const e = 1e-4;
+    return Math.abs(m[0] - 1) < e && Math.abs(m[5] - 1) < e && Math.abs(m[10] - 1) < e && Math.abs(m[15] - 1) < e
+      && Math.abs(m[1]) < e && Math.abs(m[2]) < e && Math.abs(m[4]) < e && Math.abs(m[6]) < e
+      && Math.abs(m[8]) < e && Math.abs(m[9]) < e
+      && Math.abs(m[12]) < e && Math.abs(m[13]) < e && Math.abs(m[14]) < e;
+  }
+
+  function diagPointerHandler(ev) {
+    if (!diagState.active) return;
+    const t = Math.round(performance.now() - diagState.startMs);
+    let e;
+    if (ev.type === 'pointermove') {
+      if (t - diagState.lastMoveT < 25) return;
+      diagState.lastMoveT = t;
+      e = 'm';
+    } else if (ev.type === 'pointerdown') e = 'd';
+    else if (ev.type === 'pointerup') e = 'u';
+    else e = 'w';
+    diagState.pointer.push({
+      t,
+      e,
+      x: Math.round(ev.clientX || 0),
+      y: Math.round(ev.clientY || 0),
+      b: (ev.buttons | 0),
+    });
+  }
+
+  function diagSetListeners(on) {
+    if (on === diagState.listenersOn) return;
+    diagState.listenersOn = on;
+    const fn = on ? 'addEventListener' : 'removeEventListener';
+    try {
+      for (const type of ['pointerdown', 'pointermove', 'pointerup', 'wheel']) {
+        window[fn](type, diagPointerHandler, { capture: true, passive: true });
+      }
+    } catch (e) {
+      // input capture is best-effort; stream data alone is still useful
+    }
+  }
+
+  function diagRecordUpload(c, m, changed, nowMs) {
+    let s = diagState.streams.get(c.id);
+    if (!s) {
+      if (diagState.streams.size >= DIAG_MAX_STREAMS) return;
+      s = {
+        id: c.id,
+        uniformName: c.uniformName || '',
+        programId: c.programId || '',
+        canvas: null,
+        lastQuat: null,
+        bins: new Map(),
+      };
+      diagState.streams.set(c.id, s);
+    }
+    if (!s.uniformName && c.uniformName) s.uniformName = c.uniformName;
+    if (!s.canvas && c.canvasRect) {
+      s.canvas = { w: Math.round(c.canvasRect.width), h: Math.round(c.canvasRect.height) };
+    }
+    const bi = Math.floor((nowMs - diagState.startMs) / DIAG_BIN_MS);
+    let b = s.bins.get(bi);
+    if (!b) {
+      b = { u: 0, ch: 0, rot: 0, idc: 0 };
+      s.bins.set(bi, b);
+    }
+    b.u += 1;
+    if (matrixIsIdentity16(m)) b.idc += 1;
+    if (changed) {
+      b.ch += 1;
+      const q = matrix16ToQuat(m);
+      if (q) {
+        if (s.lastQuat) {
+          const d = Math.min(1, Math.abs(quatDot(s.lastQuat, q)));
+          b.rot += (2 * Math.acos(d) * 180) / Math.PI;
+        }
+        s.lastQuat = q;
+      }
+    }
+  }
+
+  function diagRoundQuat(q) {
+    return { w: +q.w.toFixed(4), x: +q.x.toFixed(4), y: +q.y.toFixed(4), z: +q.z.toFixed(4) };
+  }
+
+  function diagTick(nowMs) {
+    if (!diagState.active) return;
+    const t = Math.round(nowMs - diagState.startMs);
+    if (cssReferenceQuat) {
+      const changedCss = !diagState.lastCssQuat
+        || Math.abs(quatDot(diagState.lastCssQuat, cssReferenceQuat)) < 0.999995;
+      if (changedCss) {
+        diagState.lastCssQuat = cssReferenceQuat;
+        diagState.css.push({ t, q: diagRoundQuat(cssReferenceQuat) });
+      }
+    }
+    if (webglState.lockedId !== diagState.lastLockedId) {
+      diagState.lastLockedId = webglState.lockedId;
+      diagState.locks.push({ t, id: webglState.lockedId, strategy: observerStrategy });
+    }
+    if (nowMs - diagState.startMs >= diagState.durationMs) diagFinish(nowMs);
+  }
+
+  function diagStart(seconds) {
+    const dur = Math.max(5, Math.min(120, Number(seconds) || 31));
+    diagState.active = true;
+    diagState.startMs = performance.now();
+    diagState.durationMs = dur * 1000;
+    diagState.finishedMs = 0;
+    diagState.resultNote = '';
+    diagState.streams = new Map();
+    diagState.pointer = [];
+    diagState.css = [];
+    diagState.locks = [];
+    diagState.lastMoveT = -1000;
+    diagState.lastCssQuat = null;
+    diagState.lastLockedId = webglState.lockedId;
+    diagState.locks.push({ t: 0, id: webglState.lockedId, strategy: observerStrategy });
+    diagSetListeners(true);
+    console.log('[USB_freeD] diagnostic recording started (' + dur + 's) — follow the panel prompts');
+    return true;
+  }
+
+  function diagFinish(nowMs) {
+    diagState.active = false;
+    diagState.finishedMs = nowMs;
+    diagSetListeners(false);
+
+    const streams = [];
+    for (const s of diagState.streams.values()) {
+      const bins = [];
+      for (const [bi, b] of s.bins.entries()) {
+        bins.push([bi, b.u, b.ch, +b.rot.toFixed(1), b.idc]);
+      }
+      bins.sort((a, bEntry) => a[0] - bEntry[0]);
+      let uploads = 0;
+      let changes = 0;
+      let rotDeg = 0;
+      for (const b of bins) { uploads += b[1]; changes += b[2]; rotDeg += b[3]; }
+      // Selector's live view of this stream at recording end, so the dump
+      // shows WHY each stream was ranked/gated the way it was.
+      const cand = webglState.candidates.get(s.id) || null;
+      const selector = cand ? {
+        locked: webglState.lockedId === s.id,
+        disqualified: candidateDisqualified(cand),
+        smooth: candidateLooksSmooth(cand),
+        idFrac: cand.calls > 0 ? +(cand.idCalls / cand.calls).toFixed(3) : 0,
+        jumpFrac: cand.stepCount > 0 ? +(cand.jumpCount / cand.stepCount).toFixed(3) : 0,
+        stepCount: cand.stepCount,
+        lastChangeAgeMs: Math.round(nowMs - cand.lastChangeMs),
+        chgWinCount: cand.chgWinCount,
+      } : null;
+      streams.push({
+        id: s.id,
+        uniformName: s.uniformName,
+        programId: s.programId,
+        canvas: s.canvas,
+        totals: { uploads, changes, rotDeg: +rotDeg.toFixed(1) },
+        selector,
+        bins,
+      });
+    }
+    streams.sort((a, b) => b.totals.rotDeg - a.totals.rotDeg);
+
+    lastDiagnostic = {
+      buildTag: BUILD_TAG,
+      recordedAt: new Date().toISOString(),
+      durationMs: Math.round(diagState.durationMs),
+      binMs: DIAG_BIN_MS,
+      userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) || '',
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+      phases: DIAG_PHASES,
+      config: {
+        webglConvention: normalizeWebglConvention(config.webglConvention),
+        preferredWebglSource: config.preferredWebglSource || null,
+        pinnedLocId: webglState.pinnedLocId || null,
+      },
+      locks: diagState.locks,
+      pointer: diagState.pointer,
+      css: diagState.css,
+      streams,
+    };
+
+    let saved = 'in memory';
+    const json = JSON.stringify(lastDiagnostic);
+    try {
+      const blob = new Blob([json], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'usb-freed-diag-' + Date.now() + '.json';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      saved = 'downloaded ' + a.download;
+    } catch (e) {
+      setLastError('diag.download', e, null);
+    }
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(json).catch(() => {});
+      }
+    } catch (e) {
+      // clipboard is best-effort
+    }
+    diagState.resultNote = 'Diagnostic done (' + streams.length + ' streams, '
+      + Math.round(json.length / 1024) + ' KB) — ' + saved
+      + '. Also on clipboard + usbFreeDWidgetWatcher.getDiagnostic().';
+    console.log('[USB_freeD] ' + diagState.resultNote);
+  }
+
+  function recordWebglMatrix(gl, location, value, transpose, srcOffset, srcLength) {
     if (!gl || !location || (typeof location !== 'object' && typeof location !== 'function')) return;
-    if (!value || typeof value.length !== 'number' || value.length !== 16) return;
+    if (!value || typeof value.length !== 'number') return;
+
+    // WebGL2 allows uniformMatrix4fv(loc, transpose, data, srcOffset, srcLength)
+    // and mat4[] uploads (length a multiple of 16). Read the first mat4 at the
+    // effective offset instead of rejecting anything that isn't exactly 16 floats.
+    const off = Number.isFinite(srcOffset) && srcOffset > 0 ? Math.floor(srcOffset) : 0;
+    const avail = Number.isFinite(srcLength) && srcLength > 0
+      ? Math.min(srcLength, value.length - off)
+      : value.length - off;
+    if (avail < 16 || off < 0 || off + 16 > value.length) return;
 
     const m = new Array(16);
     for (let i = 0; i < 16; i++) {
-      const v = Number(value[i]);
+      const v = Number(value[off + i]);
       if (!Number.isFinite(v)) return;
       m[i] = v;
+    }
+
+    if (transpose) {
+      for (let r = 0; r < 4; r++) {
+        for (let cIdx = r + 1; cIdx < 4; cIdx++) {
+          const a = r * 4 + cIdx;
+          const b = cIdx * 4 + r;
+          const t = m[a];
+          m[a] = m[b];
+          m[b] = t;
+        }
+      }
     }
 
     const err = matrixOrthoError16(m);
@@ -880,23 +1343,6 @@
     const id = glId + ':' + locId;
     const nowMs = performance.now();
     const meta = webglState.locMeta.get(location) || null;
-
-    let canvasRect = null;
-    try {
-      if (gl && gl.canvas && gl.canvas.getBoundingClientRect) {
-        const r = gl.canvas.getBoundingClientRect();
-        canvasRect = {
-          left: r.left,
-          top: r.top,
-          right: r.right,
-          bottom: r.bottom,
-          width: r.width,
-          height: r.height,
-        };
-      }
-    } catch (e) {
-      // ignore canvas rect failures
-    }
 
     let c = webglState.candidates.get(id);
     if (!c) {
@@ -914,7 +1360,26 @@
         lastSeenMs: nowMs,
         lastChangeMs: nowMs,
         lastMatrix: null,
-        canvasRect,
+        canvasRect: null,
+        canvasRectMs: 0,
+        // CSS cross-validation state, sampled only across distinct view poses:
+        // agreeEma = absolute |quat dot| match, coRotEma = rotation-amount match.
+        agreeEma: 0,
+        agreeSamples: 0,
+        coRotEma: 0,
+        coRotSamples: 0,
+        rawWins: 0,
+        invWins: 0,
+        lastAgreeRefQuat: null,
+        lastAgreeCandQuat: null,
+        // Motion signature: identity-write count and per-change step sizes.
+        idCalls: 0,
+        stepQuat: null,
+        stepCount: 0,
+        jumpCount: 0,
+        // Rolling ~1s change-rate window (frozen-lock takeover eligibility).
+        chgWinStartMs: nowMs,
+        chgWinCount: 0,
       };
       webglState.candidates.set(id, c);
     }
@@ -928,13 +1393,63 @@
     c.errSum += err;
     c.avgErr = c.errSum / c.calls;
     c.lastSeenMs = nowMs;
-    if (canvasRect) c.canvasRect = canvasRect;
 
-    if (c.lastMatrix && matrixDelta16(c.lastMatrix, m) > WEBGL_CHANGE_EPS) {
+    // Refresh the cached canvas rect at most twice a second — it's a layout
+    // read, and this hook now runs at render rate on the hot path.
+    if (nowMs - c.canvasRectMs > 500) {
+      c.canvasRectMs = nowMs;
+      try {
+        if (gl.canvas && gl.canvas.getBoundingClientRect) {
+          const r = gl.canvas.getBoundingClientRect();
+          c.canvasRect = {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+            width: r.width,
+            height: r.height,
+          };
+        }
+      } catch (e) {
+        // ignore canvas rect failures
+      }
+    }
+
+    const changed = !!c.lastMatrix && matrixDelta16(c.lastMatrix, m) > WEBGL_CHANGE_EPS;
+    if (changed) {
       c.changes += 1;
       c.lastChangeMs = nowMs;
+      if (nowMs - c.chgWinStartMs > 1000) {
+        c.chgWinStartMs = nowMs;
+        c.chgWinCount = 0;
+      }
+      c.chgWinCount += 1;
     }
     c.lastMatrix = m;
+
+    // Motion signature. A view matrix is never the identity (the camera can't
+    // sit at the model origin), so identity writes mark an overlay-multiplexed
+    // uniform. Large per-change steps mark per-object model-view streams that
+    // hop between object poses within a frame.
+    if (matrixIsIdentity16(m)) c.idCalls += 1;
+    if (changed) {
+      const stepQ = matrix16ToQuat(m);
+      if (stepQ) {
+        if (c.stepQuat) {
+          const dot = Math.min(1, Math.abs(quatDot(c.stepQuat, stepQ)));
+          c.stepCount += 1;
+          if ((2 * Math.acos(dot) * 180) / Math.PI > WEBGL_JUMP_STEP_DEG) c.jumpCount += 1;
+        }
+        c.stepQuat = stepQ;
+      }
+    }
+
+    if (diagState.active) diagRecordUpload(c, m, changed, nowMs);
+
+    // Real-time path: a change on the locked stream publishes at end-of-frame.
+    if (changed && webglState.lockedId === id) {
+      schedulePushPublish();
+    }
   }
 
   function installWebglHooks() {
@@ -947,9 +1462,9 @@
     const gl1GetUniformOrig = gl1Proto && gl1Proto.getUniformLocation;
     const gl2GetUniformOrig = gl2Proto && gl2Proto.getUniformLocation;
 
-    const wrap = (orig) => function wrappedUniformMatrix4fv(location, transpose, value) {
+    const wrap = (orig) => function wrappedUniformMatrix4fv(location, transpose, value, srcOffset, srcLength) {
       try {
-        recordWebglMatrix(this, location, value);
+        recordWebglMatrix(this, location, value, transpose, srcOffset, srcLength);
       } catch (e) {
         setLastError('webgl.record', e, null);
       }
@@ -1033,23 +1548,7 @@
           }
         }
 
-        // Before falling back to full scoring, try the default locId hints in order.
-        let defaultHintCandidate = null;
-        if (!preferred) {
-          for (const hint of WEBGL_DEFAULT_LOC_HINTS) {
-            for (const c of webglState.candidates.values()) {
-              if (c.locId !== hint || !c.lastMatrix) continue;
-              const hintAge = nowMs - c.lastSeenMs;
-              if (hintAge > WEBGL_CANDIDATE_TTL_MS * 2) continue;
-              if (c.calls < WEBGL_MIN_CALLS || c.changes < WEBGL_MIN_CHANGES) continue;
-              defaultHintCandidate = c;
-              break;
-            }
-            if (defaultHintCandidate) break;
-          }
-        }
-
-        const target = preferred || defaultHintCandidate || chooseBestWebglCandidate(anchor);
+        const target = preferred || chooseBestWebglCandidate(anchor);
         const current = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
         if (shouldSwitchWebglLock(current, target, anchor, nowMs)) {
           webglState.lockedId = target.id;
@@ -1083,7 +1582,11 @@
       strategy: isHeld ? 'webgl-uniform-matrix4fv-hold' : 'webgl-uniform-matrix4fv',
       debug: isHeld
         ? 'holding last WebGL orientation from ' + locked.id + ' (' + Math.round(ageMs) + 'ms idle)'
-        : 'orientation from WebGL uniform ' + locked.id + ' (' + webglState.convention + ')',
+        : 'orientation from WebGL uniform ' + (locked.uniformName || locked.id) + ' (' + webglState.convention
+          + (locked.coRotSamples >= WEBGL_AGREE_MIN_SAMPLES
+            ? ', track ' + Math.round(locked.coRotEma * 100) + '%, fit ' + Math.round(locked.agreeEma * 100) + '%'
+            : ', unvalidated')
+          + ')',
     };
   }
 
@@ -1097,11 +1600,22 @@
       preferredMatch: preferredMatchesCandidate(c),
       score: c.score,
       continuity: c.continuity,
+      agree: c.agree,
+      agreeSamples: c.agreeSamples,
+      coRot: c.coRot,
+      coRotSamples: c.coRotSamples,
+      validated: c.validated,
+      convention: c.invWins > c.rawWins ? 'inverse' : (c.rawWins > 0 ? 'raw' : null),
       calls: c.calls,
       changes: c.changes,
       avgErr: Math.round(c.avgErr * 100000) / 100000,
       ageMs: c.ageMs,
       changeAgeMs: c.changeAgeMs,
+      idFrac: c.calls > 0 ? Math.round((c.idCalls / c.calls) * 1000) / 1000 : 0,
+      jumpFrac: c.stepCount > 0 ? Math.round((c.jumpCount / c.stepCount) * 1000) / 1000 : 0,
+      stepCount: c.stepCount,
+      disqualified: candidateDisqualified(c),
+      smooth: candidateLooksSmooth(c),
       locked: c.id === webglState.lockedId,
       hasMatrix: !!c.lastMatrix,
     }));
@@ -1111,6 +1625,8 @@
       lockedId: webglState.lockedId,
       convention: webglState.convention,
       preferred: config.preferredWebglSource,
+      cssReferenceFresh: cssReferenceFresh(nowMs),
+      cssReferenceAgeMs: cssReferenceLastMs ? Math.round(nowMs - cssReferenceLastMs) : null,
       count: items.length,
       items: items.slice(0, 40),
     };
@@ -1123,6 +1639,9 @@
       ...c,
       score: Math.round(scoreWebglCandidate(c, refAnchor) * 100) / 100,
       continuity: Math.round(candidateContinuityWithObserver(c) * 1000) / 1000,
+      agree: c.agreeSamples > 0 ? Math.round(c.agreeEma * 1000) / 1000 : null,
+      coRot: c.coRotSamples > 0 ? Math.round(c.coRotEma * 1000) / 1000 : null,
+      validated: candidateIsValidated(c),
       ageMs: Math.round(nowMs - c.lastSeenMs),
       changeAgeMs: Math.round(nowMs - c.lastChangeMs),
     })).sort((a, b) => {
@@ -1140,23 +1659,27 @@
     const lock = item.id === webglState.lockedId ? '* ' : '';
     const pinMark = webglState.pinnedLocId && item.locId === webglState.pinnedLocId ? '! ' : '';
     const age = item.ageMs + 'ms';
-    const continuityPct = Math.round((item.continuity || 0) * 100);
+    const matchPct = item.coRot !== null && item.coRot !== undefined
+      ? 'trk ' + Math.round(item.coRot * 100) + '%' + (item.validated ? '✓' : '') + ' fit ' + Math.round((item.agree || 0) * 100) + '%'
+      : 'c ' + Math.round((item.continuity || 0) * 100) + '%';
     const canvasSz = item.canvasRect
       ? Math.round(item.canvasRect.width) + 'x' + Math.round(item.canvasRect.height)
       : '';
-    return lock + pinMark + uniqueName + (canvasSz ? ' [' + canvasSz + ']' : '') + ' | c ' + continuityPct + '% | chg ' + item.changes + ' | age ' + age;
+    const sig = candidateDisqualified(item) ? ' ✗' + candidateDisqualified(item) : (candidateLooksSmooth(item) ? ' ✓cam' : '');
+    return lock + pinMark + uniqueName + (canvasSz ? ' [' + canvasSz + ']' : '') + sig + ' | ' + matchPct + ' | chg ' + item.changes + ' | age ' + age;
   }
 
   function refreshSourceControls(nowMs = performance.now()) {
     if (!sourceSelect) return;
+    if (sourceSelectOpen) return;
+    if (nowMs < sourceControlsNextRefreshMs && sourceSelect.options.length > 0) return;
+    sourceControlsNextRefreshMs = nowMs + 2000;
 
-    const items = listWebglSourceItems(findWidgetAnchor(), nowMs).slice(0, 18);
-    const preferredKey = config.preferredWebglSource
-      ? ((config.preferredWebglSource.uniformName || '') + ':' + (config.preferredWebglSource.locHint || ''))
-      : 'none';
-    const signature = preferredKey + '|' + (webglState.lockedId || '-') + '|' + items.map((i) => i.id + ':' + i.ageMs + ':' + i.changes + ':' + (i.id === webglState.lockedId ? 'L' : '-')).join('|');
-    if (signature === sourceOptionsSignature && sourceSelect.options.length > 0) return;
-    sourceOptionsSignature = signature;
+    // Stable order (by id) so entries don't hop around as scores fluctuate;
+    // listWebglSourceItems' score sort still decides *which* 18 are shown.
+    const items = listWebglSourceItems(findWidgetAnchor(), nowMs)
+      .slice(0, 18)
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
     const currentValue = sourceSelect.value || '';
     sourceSelect.textContent = '';
@@ -1292,7 +1815,14 @@
 
   function publishOrientation(nowMs) {
     if (!observerQuat) return;
-    if ((nowMs - observerLastPublishMs) < 30) return;
+    if ((nowMs - observerLastPublishMs) < PUSH_MIN_INTERVAL_MS) return;
+
+    if (nowMs - publishWindowStartMs >= 1000) {
+      publishHz = publishWindowStartMs ? publishCountWindow : 0;
+      publishWindowStartMs = nowMs;
+      publishCountWindow = 0;
+    }
+    publishCountWindow += 1;
 
     const e = quatToEuler(observerQuat);
     const payload = {
@@ -1763,7 +2293,7 @@
 
       const score = scoreNode(rect);
       if (!best || score > best.score) {
-        best = { quat: q, score, strategy };
+        best = { quat: q, score, strategy, el };
       }
     };
 
@@ -1789,6 +2319,10 @@
     }
 
     if (!best) return null;
+
+    // Cache the winning element so lock re-validation can re-read just its
+    // transform instead of repeating this whole scan.
+    cssReferenceEl = best.el || null;
 
     return {
       quat: best.quat,
@@ -2395,6 +2929,122 @@
     };
   }
 
+  function applySample(sample, nowMs) {
+    const q = quatNormalize(sample.quat);
+    if (!q) return false;
+
+    if (!observerRawQuat) {
+      observerRawQuat = q;
+    } else {
+      const blend = Math.max(0.01, Math.min(0.9, config.smoothing));
+      observerRawQuat = quatLerp(observerRawQuat, q, blend) || q;
+    }
+
+    observerQuat = applyFrameCalibration(observerRawQuat);
+    observerStrategy = sample.strategy;
+    observerConfidence = sample.confidence;
+    observerDebug = sample.debug;
+    observerLastUpdateMs = nowMs;
+    publishOrientation(nowMs);
+    return true;
+  }
+
+  // Passive telemetry while a WebGL lock is held: re-read the cached CSS
+  // reference element (one getComputedStyle) and update the per-candidate
+  // trk/fit metrics for the dropdown and debug dumps. Never touches the lock.
+  function refreshLockTelemetry(nowMs) {
+    const el = cssReferenceEl;
+    if (!el || !el.isConnected) {
+      cssReferenceEl = null;
+      return;
+    }
+
+    let q = null;
+    try {
+      const style = window.getComputedStyle(el);
+      q = parseMatrix3d(style.transform) || parseMatrix3d(style.webkitTransform);
+    } catch (e) {
+      q = null;
+    }
+    if (!q) {
+      cssReferenceEl = null;
+      return;
+    }
+
+    cssReferenceQuat = q;
+    cssReferenceLastMs = nowMs;
+    updateWebglAgreement(nowMs);
+  }
+
+  // The one departure from "a lock is never second-guessed": if the locked
+  // stream has been DEAD for a while (its uniform stopped being uploaded) and
+  // other streams are active, relock instead of holding a corpse for minutes.
+  // Pure in-memory stats — no DOM work, so the fast path stays smooth.
+  function recoverDeadLock(nowMs) {
+    // A pinned source is re-grabbed whenever it's alive but not locked
+    // (e.g. after a temporary dead-stream fallback below).
+    if (webglState.pinnedLocId) {
+      for (const c of webglState.candidates.values()) {
+        if (c.locId !== webglState.pinnedLocId || !c.lastMatrix) continue;
+        if ((nowMs - c.lastSeenMs) > WEBGL_CANDIDATE_TTL_MS * 2) continue;
+        if (webglState.lockedId !== c.id) {
+          webglState.lockedId = c.id;
+          webglState.convention = null;
+        }
+        return;
+      }
+    }
+
+    const locked = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
+
+    // Evict a lock whose motion signature turned out bad (identity overlay
+    // writes or per-object jumps). Frame-final publishing can make such a
+    // stream *look* right as long as the camera-linked object happens to be
+    // drawn last, but that is draw-order luck — move to a stream that is
+    // intrinsically the camera as soon as one qualifies.
+    if (locked && candidateDisqualified(locked)) {
+      const better = chooseBestWebglCandidate(null);
+      if (better && better.id !== locked.id) {
+        webglState.lockedId = better.id;
+        webglState.convention = null;
+      }
+      return;
+    }
+
+    // Frozen-lock takeover: the locked stream still uploads (so it is not
+    // "dead") but hasn't changed in over a second while another qualified
+    // stream is changing at render rate. Settle-only overlay streams create
+    // exactly this state during a drag — the widget would only update on
+    // release. The stream that is moving NOW is the camera; take the lock.
+    if (locked && (nowMs - locked.lastChangeMs) > WEBGL_FROZEN_LOCK_MS) {
+      let target = null;
+      let targetScore = -Infinity;
+      for (const c of webglState.candidates.values()) {
+        if (c.id === locked.id || !c.lastMatrix) continue;
+        if ((nowMs - c.lastChangeMs) > WEBGL_TAKEOVER_FRESH_MS) continue;
+        if (c.chgWinCount < WEBGL_TAKEOVER_MIN_CHANGES) continue;
+        const s = scoreWebglCandidate(c, null);
+        if (Number.isFinite(s) && s > targetScore) {
+          targetScore = s;
+          target = c;
+        }
+      }
+      if (target) {
+        webglState.lockedId = target.id;
+        webglState.convention = null;
+        return;
+      }
+    }
+
+    if (locked && (nowMs - locked.lastSeenMs) <= WEBGL_CANDIDATE_TTL_MS * 2) return;
+
+    const target = chooseBestWebglCandidate(null);
+    if (target && (!locked || target.id !== locked.id)) {
+      webglState.lockedId = target.id;
+      webglState.convention = null;
+    }
+  }
+
   function scanWidgetOrientation(nowMs) {
     if (!config.watcherEnabled) {
       observerStrategy = 'disabled';
@@ -2403,15 +3053,22 @@
       return;
     }
 
-    // Fast path: if already locked on a WebGL source, read its matrix directly
-    // at the tick rate without doing full candidate collection/CSS scan.
-    const lockedFastPath = !!webglState.lockedId;
-    const scanIntervalMs = lockedFastPath ? SCAN_INTERVAL_LOCKED_MS : SCAN_INTERVAL_MS;
+    // Fast path: once locked on a WebGL source, read its matrix directly at
+    // the tick rate — no candidate collection, no CSS scan, no arbitration.
+    // A live locked stream is never second-guessed; that's what keeps this
+    // path perfectly smooth. Low-rate housekeeping (telemetry + dead-stream
+    // recovery) runs in-memory alongside it every WEBGL_LOCK_RECHECK_MS.
+    const scanIntervalMs = webglState.lockedId ? SCAN_INTERVAL_LOCKED_MS : SCAN_INTERVAL_MS;
     if (nowMs - observerLastScanMs < scanIntervalMs) return;
     observerLastScanMs = nowMs;
 
-    if (lockedFastPath) {
-      const locked = webglState.candidates.get(webglState.lockedId);
+    if (webglState.lockedId) {
+      if ((nowMs - webglState.lockLastCheckedMs) > WEBGL_LOCK_RECHECK_MS) {
+        webglState.lockLastCheckedMs = nowMs;
+        refreshLockTelemetry(nowMs);
+        recoverDeadLock(nowMs);
+      }
+      const locked = webglState.lockedId ? webglState.candidates.get(webglState.lockedId) : null;
       if (locked && locked.lastMatrix) {
         const ageMs = nowMs - locked.lastSeenMs;
         if (ageMs <= WEBGL_HOLD_MAX_MS) {
@@ -2443,7 +3100,13 @@
     // If CSS succeeds it breaks the circular self-confirmation that causes wrong initial lock.
     const cssCandidate = (mode !== 'semantic') ? extractFromCssMatrix(candidates, info.anchor) : null;
     if (cssCandidate && cssCandidate.quat) {
-      cssReferenceQuat = quatNormalize(cssCandidate.quat);
+      const q = quatNormalize(cssCandidate.quat);
+      if (q) {
+        cssReferenceQuat = q;
+        cssReferenceLastMs = nowMs;
+        // Score every fresh WebGL stream against this ground-truth pose.
+        updateWebglAgreement(nowMs);
+      }
     }
 
     let sample = extractFromWebglUniform(info.anchor, nowMs);
@@ -2492,23 +3155,7 @@
       return;
     }
 
-    const q = quatNormalize(sample.quat);
-    if (!q) return;
-
-    if (!observerRawQuat) {
-      observerRawQuat = q;
-    } else {
-      const blend = Math.max(0.01, Math.min(0.9, config.smoothing));
-      observerRawQuat = quatLerp(observerRawQuat, q, blend) || q;
-    }
-
-    observerQuat = applyFrameCalibration(observerRawQuat);
-
-    observerStrategy = sample.strategy;
-    observerConfidence = sample.confidence;
-    observerDebug = sample.debug;
-    observerLastUpdateMs = nowMs;
-    publishOrientation(nowMs);
+    applySample(sample, nowMs);
   }
 
   function makeDraggable(el, handle) {
@@ -2563,6 +3210,7 @@
         <div class="usb-freed-row">
           <button id="usb-freed-cal-front" class="usb-freed-btn usb-freed-btn-sm">Set Current = Front</button>
           <button id="usb-freed-cal-reset" class="usb-freed-btn usb-freed-btn-sm">Clear Align</button>
+          <button id="usb-freed-diag-btn" class="usb-freed-btn usb-freed-btn-sm" title="Record a 30s diagnostic of all matrix streams + input">Record diag</button>
         </div>
 
         <div id="usb-freed-watch-note" class="usb-freed-hint">Upper-right view widget watcher is active.</div>
@@ -2610,6 +3258,15 @@
       connectSerial();
     });
 
+    // Suspend option rebuilds while the select is focused/unfurled — rebuilding
+    // a native select's options mid-interaction detaches its popup.
+    sourceSelect.addEventListener('pointerdown', () => { sourceSelectOpen = true; });
+    sourceSelect.addEventListener('focus', () => { sourceSelectOpen = true; });
+    sourceSelect.addEventListener('blur', () => {
+      sourceSelectOpen = false;
+      sourceControlsNextRefreshMs = 0;
+    });
+
     sourceSelect.addEventListener('change', () => {
       const chosen = sourceSelect.value;
       if (!chosen) {
@@ -2622,6 +3279,9 @@
         }
       }
       resetWebglLock();
+      sourceSelectOpen = false;
+      sourceControlsNextRefreshMs = 0;
+      sourceSelect.blur();
       updatePanel();
     });
 
@@ -2635,6 +3295,14 @@
       clearCalibration();
       updatePanel();
     });
+
+    diagBtn = panel.querySelector('#usb-freed-diag-btn');
+    if (diagBtn) {
+      diagBtn.addEventListener('click', () => {
+        if (!diagState.active) diagStart(31);
+        updatePanel();
+      });
+    }
 
     minimizeBtn.addEventListener('click', () => {
       const hidden = body.style.display === 'none';
@@ -2663,6 +3331,20 @@
 
     const nowMs = performance.now();
     const serialSuffix = serialConnected ? ' | serial: ON' : '';
+
+    if (diagBtn) diagBtn.textContent = diagState.active ? 'REC…' : 'Record diag';
+    if (diagState.active) {
+      const remainS = Math.max(0, Math.ceil((diagState.startMs + diagState.durationMs - nowMs) / 1000));
+      noteEl.textContent = 'REC ' + remainS + 's — ' + diagPhaseLabel((nowMs - diagState.startMs) / 1000);
+      drawOrientationPreview(observerQuat, !observerQuat || observerIsStale(nowMs));
+      return;
+    }
+    if (diagState.resultNote && nowMs - diagState.finishedMs < 20000) {
+      noteEl.textContent = diagState.resultNote;
+      drawOrientationPreview(observerQuat, !observerQuat || observerIsStale(nowMs));
+      return;
+    }
+
     if (!config.watcherEnabled) {
       noteEl.textContent = 'Watcher disabled.';
       calibrateBtn.disabled = true;
@@ -2674,17 +3356,28 @@
     const stale = observerIsStale(nowMs);
     const ageMs = observerLastUpdateMs > 0 ? Math.round(nowMs - observerLastUpdateMs) : 0;
 
+    // Rate readout: how many orientation samples were published in the last
+    // rolling second. During a drag on a locked stream this should sit near
+    // the page's render rate (via push-mode); 0 means output is not live.
+    const displayHz = (nowMs - observerLastPublishMs) > 1000 ? 0 : publishHz;
+    // Make it obvious when selection is being steered by an explicit pin or a
+    // saved fingerprint from an earlier session (a stale one can silently
+    // grab a bad stream on every reload).
+    const steerSuffix = webglState.pinnedLocId
+      ? ' | PINNED'
+      : (config.preferredWebglSource ? ' | saved pref active' : '');
+
     if (!observerQuat || stale) {
       calibrateBtn.disabled = true;
       clearCalBtn.disabled = !calOn;
-      noteEl.textContent = observerDebug + (observerLastUpdateMs ? (' | last sample ' + ageMs + 'ms ago') : '') + serialSuffix;
+      noteEl.textContent = observerDebug + (observerLastUpdateMs ? (' | last sample ' + ageMs + 'ms ago') : '') + ' | ' + displayHz + ' Hz' + steerSuffix + serialSuffix;
       drawOrientationPreview(observerQuat, true);
       return;
     }
 
     calibrateBtn.disabled = false;
     clearCalBtn.disabled = !calOn;
-    noteEl.textContent = observerDebug + ' | sample age ' + ageMs + 'ms' + serialSuffix;
+    noteEl.textContent = observerDebug + ' | age ' + ageMs + 'ms | ' + displayHz + ' Hz' + steerSuffix + serialSuffix;
     drawOrientationPreview(observerQuat, false);
   }
 
@@ -2692,6 +3385,7 @@
     try {
       const nowMs = performance.now();
       scanWidgetOrientation(nowMs);
+      diagTick(nowMs);
       updatePanel();
     } catch (err) {
       observerStrategy = 'error';
@@ -2724,6 +3418,9 @@
         calibration: getCalibrationQuat(),
         webglConvention: normalizeWebglConvention(config.webglConvention),
         lockedWebglSourceId: webglState.lockedId,
+        publishHz,
+        cssReferenceAgeMs: cssReferenceLastMs ? Math.round(performance.now() - cssReferenceLastMs) : null,
+        cssReferenceQuat,
         pinnedWebglLocId: webglState.pinnedLocId,
         preferredWebglSource: config.preferredWebglSource,
         lastOrientation: window.__usbFreeDLastOrientation || null,
@@ -2745,6 +3442,8 @@
         locked: c.id === webglState.lockedId,
         preferredMatch: preferredMatchesCandidate(c),
       })),
+      startDiagnostic: (seconds) => diagStart(seconds),
+      getDiagnostic: () => lastDiagnostic,
       pinLockedWebglSource: () => pinPreferredWebglSource(null),
       pinWebglSourceById: (id) => pinPreferredWebglSource(id),
       clearPinnedWebglSource: () => clearPreferredWebglSource(),
