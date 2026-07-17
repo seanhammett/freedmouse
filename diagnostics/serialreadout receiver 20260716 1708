@@ -1,0 +1,150 @@
+ *  Executing task: platformio device monitor --environment receiver 
+
+--- Terminal on /dev/cu.usbserial-120 | 115200 8-N-1
+--- Available filters and text transformations: debug, default, direct, esp32_exception_decoder, hexlify, log2file, nocontrol, printable, send_on_enter, time
+--- More details at https://bit.ly/pio-monitor-filters
+--- Quit: Ctrl+C | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H
+[RX] pkts=0 drops=0 ooo=0 sboot=0 hid=0 hidSkip=0 hidReady=0 tgt=0 ageMs=0 cdcDrop=20
+[RX] pkts=0 drops=0 ooo=0 sboot=0 hid=0 hidSkip=0 hidReady=0 tgt=0 ageMs=0 cdcDrop=21
+[RX] pkts=0 drops=0 ooo=0 sboot=0 hid=0 hidSkip=0 hidReady=0 tgt=0 ageMs=0 cdcDrop=22
+[RX] pkts=0 drops=0 ooo=0 sboot=0 hid=0 hidSkip=0 hidReady=0 tgt=0 ageMs=0 cdcDrop=23
+[RX] pkts=0 drops=0 ooo=0 sboot=0 hid=0 hidSkip=0 hidReady=0 tgt=0 ageMs=0 cdcDrop=24
+[RX] pkts=0 drops=0 ooo=0 sboot=0 hid=0 hidSkip=0 hidReady=0 tgt=0 ageMs=0 cdcDrop=25
+[RX] pkts=6 drops=0 ooo=0 sboot=0 hid=0 hidSkip=88 hidReady=0 tgt=0 ageMs=3 cdcDrop=27
+[RX] pkts=106 drops=0 ooo=0 sboot=0 hid=0 hidSkip=2088 hidReady=0 tgt=0 ageMs=3 cdcDrop=47
+[RX] pkts=206 drops=0 ooo=0 sboot=0 hid=0 hidSkip=4088 hidReady=0 tgt=0 ageMs=3 cdcDrop=68
+[RX] pkts=306 drops=0 ooo=0 sboot=0 hid=0 hidSkip=6088 hidReady=0 tgt=0 ageMs=2 cdcDrop=88
+[RX] pkts=406 drops=0 ooo=0 sboot=0 hid=92 hidSkip=6450 hidReady=0 tgt=0 ageMs=4 cdcDrop=108
+[RX] pkts=506 drops=0 ooo=0 sboot=0 hid=192 hidSkip=6650 hidReady=0 tgt=0 ageMs=3 cdcDrop=129
+[RX] pkts=606 drops=0 ooo=0 sboot=0 hid=290 hidSkip=6872 hidReady=0 tgt=0 ageMs=3 cdcDrop=148
+[RX] pkts=705 drops=0 ooo=0 sboot=0 hid=389 hidSkip=7084 hidReady=0 tgt=0 ageMs=13 cdcDrop=168
+[RX] pkts=806 drops=0 ooo=0 sboot=0 hid=490 hidSkip=7286 hidReady=0 tgt=0 ageMs=3 cdcDrop=189
+[RX] pkts=906 drops=0 ooo=0 sboot=0 hid=590 hidSkip=7486 hidReady=0 tgt=0 ageMs=3 cdcDrop=209
+[RX] pkts=1006 drops=0 ooo=0 sboot=0 hid=690 hidSkip=7686 hidReady=0 tgt=0 ageMs=3 cdcDrop=228
+[RX] pkts=1106 drops=0 ooo=0 sboot=0 hid=790 hidSkip=7886 hidReady=0 tgt=0 ageMs=4 cdcDrop=249
+[RX] pkts=1206 drops=0 ooo=0 sboot=0 hid=890 hidSkip=8086 hidReady=0 tgt=0 ageMs=2 cdcDrop=268
+[RX] pkts=1306 drops=0 ooo=0 sboot=0 hid=990 hidSkip=8286 hidReady=0 tgt=0 ageMs=4 cdcDrop=288
+[RX] pkts=1406 drops=0 ooo=0 sboot=0 hid=1090 hidSkip=8486 hidReady=0 tgt=0 ageMs=4 cdcDrop=308
+[RX] pkts=1506 drops=0 ooo=0 sboot=0 hid=1190 hidSkip=8686 hidReady=0 tgt=0 ageMs=3 cdcDrop=329
+[RX] pkts=1606 drops=0 ooo=0 sboot=0 hid=1290 hidSkip=8886 hidReady=0 tgt=0 ageMs=3 cdcDrop=348
+[RX] pkts=1706 drops=0 ooo=0 sboot=0 hid=1390 hidSkip=9086 hidReady=0 tgt=0 ageMs=3 cdcDrop=369
+[RX] pkts=1806 drops=0 ooo=0 sboot=0 hid=1490 hidSkip=9286 hidReady=0 tgt=0 ageMs=3 cdcDrop=390
+[RX] pkts=1906 drops=0 ooo=0 sboot=0 hid=1589 hidSkip=9504 hidReady=0 tgt=0 ageMs=2 cdcDrop=410
+[RX] pkts=2006 drops=0 ooo=0 sboot=0 hid=1675 hidSkip=9952 hidReady=0 tgt=0 ageMs=3 cdcDrop=429
+[RX] pkts=2106 drops=0 ooo=0 sboot=0 hid=1764 hidSkip=10348 hidReady=0 tgt=0 ageMs=3 cdcDrop=449
+[RX] pkts=2206 drops=0 ooo=0 sboot=0 hid=1863 hidSkip=10564 hidReady=0 tgt=0 ageMs=3 cdcDrop=469
+[RX] pkts=2306 drops=0 ooo=0 sboot=0 hid=1963 hidSkip=10764 hidReady=0 tgt=0 ageMs=3 cdcDrop=490
+[ 46840][E][USBHID.cpp:362] SendReport(): report 1 wait failed
+[RX] pkts=2406 drops=0 ooo=0 sboot=0 hid=2063 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=510
+[RX] pkts=2506 drops=0 ooo=0 sboot=0 hid=2163 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=530
+[RX] pkts=2606 drops=0 ooo=0 sboot=0 hid=2263 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=551
+[RX] pkts=2706 drops=0 ooo=0 sboot=0 hid=2363 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=571
+[RX] pkts=2806 drops=0 ooo=0 sboot=0 hid=2463 hidSkip=10901 hidReady=1 tgt=0 ageMs=1 cdcDrop=592
+[RX] pkts=2906 drops=0 ooo=0 sboot=0 hid=2563 hidSkip=10901 hidReady=1 tgt=0 ageMs=1 cdcDrop=612
+[RX] pkts=3006 drops=0 ooo=0 sboot=0 hid=2663 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=633
+[RX] pkts=3106 drops=0 ooo=0 sboot=0 hid=2740 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=652
+[RX] pkts=3206 drops=0 ooo=0 sboot=0 hid=2740 hidSkip=10901 hidReady=1 tgt=0 ageMs=2 cdcDrop=673
+[RX] pkts=3306 drops=0 ooo=0 sboot=0 hid=2740 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=693
+[RX] pkts=3406 drops=0 ooo=0 sboot=0 hid=2830 hidSkip=10901 hidReady=1 tgt=0 ageMs=2 cdcDrop=713
+[RX] pkts=3506 drops=0 ooo=0 sboot=0 hid=2930 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=732
+[RX] pkts=3606 drops=0 ooo=0 sboot=0 hid=3015 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=753
+[RX] pkts=3705 drops=0 ooo=0 sboot=0 hid=3020 hidSkip=10901 hidReady=1 tgt=0 ageMs=10 cdcDrop=773
+[RX] pkts=3806 drops=0 ooo=0 sboot=0 hid=3120 hidSkip=10901 hidReady=1 tgt=0 ageMs=1 cdcDrop=794
+[RX] pkts=3906 drops=0 ooo=0 sboot=0 hid=3213 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=814
+[RX] pkts=4006 drops=0 ooo=0 sboot=0 hid=3313 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=835
+[RX] pkts=4106 drops=0 ooo=0 sboot=0 hid=3413 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=855
+[RX] pkts=4205 drops=0 ooo=0 sboot=0 hid=3481 hidSkip=10901 hidReady=1 tgt=0 ageMs=9 cdcDrop=875
+[RX] pkts=4306 drops=0 ooo=0 sboot=0 hid=3481 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=895
+[RX] pkts=4406 drops=0 ooo=0 sboot=0 hid=3574 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=914
+[RX] pkts=4506 drops=0 ooo=0 sboot=0 hid=3670 hidSkip=10901 hidReady=1 tgt=0 ageMs=1 cdcDrop=935
+[RX] pkts=4606 drops=0 ooo=0 sboot=0 hid=3762 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=954
+[RX] pkts=4706 drops=0 ooo=0 sboot=0 hid=3779 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=974
+[RX] pkts=4806 drops=0 ooo=0 sboot=0 hid=3819 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=994
+[RX] pkts=4906 drops=0 ooo=0 sboot=0 hid=3883 hidSkip=10901 hidReady=1 tgt=1 ageMs=2 cdcDrop=1027
+[RX] pkts=5006 drops=0 ooo=0 sboot=0 hid=3911 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1069
+[RX] pkts=5106 drops=0 ooo=0 sboot=0 hid=3927 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1110
+[RX] pkts=5206 drops=0 ooo=0 sboot=0 hid=3944 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1153
+[RX] pkts=5306 drops=0 ooo=0 sboot=0 hid=3961 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1194
+[RX] pkts=5406 drops=0 ooo=0 sboot=0 hid=3979 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1235
+[RX] pkts=5506 drops=0 ooo=0 sboot=0 hid=4011 hidSkip=10901 hidReady=1 tgt=1 ageMs=3 cdcDrop=1276
+[RX] pkts=5606 drops=0 ooo=0 sboot=0 hid=4042 hidSkip=10901 hidReady=1 tgt=1 ageMs=3 cdcDrop=1316
+[RX] pkts=5706 drops=0 ooo=0 sboot=0 hid=4071 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=1356
+[RX] pkts=5806 drops=0 ooo=0 sboot=0 hid=4089 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=1398
+[TGT] target lock lost (serial quiet) — open loop
+[TGT] target lock lost (serial quiet) — open loop
+[RX] pkts=5906 drops=0 ooo=0 sboot=0 hid=4138 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=1421
+[TGT] target lock lost (serial quiet) — open loop
+[RX] pkts=6006 drops=0 ooo=0 sboot=0 hid=4189 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=1443
+[TGT] target lock lost (serial quiet) — open loop
+[RX] pkts=6106 drops=1 ooo=0 sboot=0 hid=4240 hidSkip=10901 hidReady=1 tgt=0 ageMs=5 cdcDrop=1465
+[TGT] target lock lost (serial quiet) — open loop
+[RX] pkts=6206 drops=1 ooo=0 sboot=0 hid=4291 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=1487
+[RX] pkts=6306 drops=1 ooo=0 sboot=0 hid=4323 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1530
+[RX] pkts=6406 drops=1 ooo=0 sboot=0 hid=4347 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=1572
+[TGT] target lock lost (serial quiet) — open loop
+[RX] pkts=6506 drops=1 ooo=0 sboot=0 hid=4421 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=1598
+[RX] pkts=6606 drops=1 ooo=0 sboot=0 hid=4521 hidSkip=10901 hidReady=1 tgt=0 ageMs=5 cdcDrop=1618
+[RX] pkts=6706 drops=1 ooo=0 sboot=0 hid=4621 hidSkip=10901 hidReady=1 tgt=0 ageMs=5 cdcDrop=1638
+[RX] pkts=6806 drops=1 ooo=0 sboot=0 hid=4721 hidSkip=10901 hidReady=1 tgt=0 ageMs=5 cdcDrop=1659
+[RX] pkts=6906 drops=1 ooo=0 sboot=0 hid=4821 hidSkip=10901 hidReady=1 tgt=0 ageMs=5 cdcDrop=1678
+[RX] pkts=7006 drops=1 ooo=0 sboot=0 hid=4921 hidSkip=10901 hidReady=1 tgt=0 ageMs=5 cdcDrop=1697
+[RX] pkts=7106 drops=1 ooo=0 sboot=0 hid=5021 hidSkip=10901 hidReady=1 tgt=0 ageMs=5 cdcDrop=1717
+[RX] pkts=7206 drops=1 ooo=0 sboot=0 hid=5121 hidSkip=10901 hidReady=1 tgt=0 ageMs=3 cdcDrop=1737
+[RX] pkts=7306 drops=1 ooo=0 sboot=0 hid=5221 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=1757
+[RX] pkts=7406 drops=1 ooo=0 sboot=0 hid=5321 hidSkip=10901 hidReady=1 tgt=0 ageMs=6 cdcDrop=1775
+[RX] pkts=7505 drops=1 ooo=0 sboot=0 hid=5409 hidSkip=10901 hidReady=1 tgt=0 ageMs=15 cdcDrop=1795
+[RX] pkts=7606 drops=1 ooo=0 sboot=0 hid=5417 hidSkip=10901 hidReady=1 tgt=0 ageMs=4 cdcDrop=1814
+[RX] pkts=7706 drops=1 ooo=0 sboot=0 hid=5420 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1837
+[RX] pkts=7806 drops=1 ooo=0 sboot=0 hid=5450 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1878
+[RX] pkts=7906 drops=1 ooo=0 sboot=0 hid=5481 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=1920
+[RX] pkts=8006 drops=1 ooo=0 sboot=0 hid=5511 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=1961
+[RX] pkts=8106 drops=1 ooo=0 sboot=0 hid=5555 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=2003
+[RX] pkts=8206 drops=1 ooo=0 sboot=0 hid=5601 hidSkip=10901 hidReady=1 tgt=1 ageMs=6 cdcDrop=2045
+[RX] pkts=8306 drops=1 ooo=0 sboot=0 hid=5636 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2085
+[RX] pkts=8406 drops=1 ooo=0 sboot=0 hid=5688 hidSkip=10901 hidReady=1 tgt=1 ageMs=6 cdcDrop=2126
+[RX] pkts=8506 drops=1 ooo=0 sboot=0 hid=5717 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2167
+[RX] pkts=8606 drops=1 ooo=0 sboot=0 hid=5760 hidSkip=10901 hidReady=1 tgt=1 ageMs=6 cdcDrop=2208
+[RX] pkts=8706 drops=1 ooo=0 sboot=0 hid=5810 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2249
+[RX] pkts=8806 drops=1 ooo=0 sboot=0 hid=5842 hidSkip=10901 hidReady=1 tgt=1 ageMs=6 cdcDrop=2288
+[RX] pkts=8906 drops=1 ooo=0 sboot=0 hid=5890 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2329
+[RX] pkts=9006 drops=1 ooo=0 sboot=0 hid=5921 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2371
+[RX] pkts=9106 drops=1 ooo=0 sboot=0 hid=5952 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2413
+[RX] pkts=9206 drops=1 ooo=0 sboot=0 hid=5980 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2454
+[RX] pkts=9306 drops=1 ooo=0 sboot=0 hid=6012 hidSkip=10901 hidReady=1 tgt=1 ageMs=3 cdcDrop=2497
+[RX] pkts=9406 drops=1 ooo=0 sboot=0 hid=6044 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2539
+[RX] pkts=9506 drops=1 ooo=0 sboot=0 hid=6071 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=2581
+[RX] pkts=9606 drops=1 ooo=0 sboot=0 hid=6101 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2622
+[RX] pkts=9706 drops=1 ooo=0 sboot=0 hid=6138 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2665
+[RX] pkts=9806 drops=1 ooo=0 sboot=0 hid=6169 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2708
+[RX] pkts=9906 drops=1 ooo=0 sboot=0 hid=6198 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2747
+[RX] pkts=10006 drops=1 ooo=0 sboot=0 hid=6229 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2787
+[RX] pkts=10106 drops=1 ooo=0 sboot=0 hid=6256 hidSkip=10901 hidReady=1 tgt=1 ageMs=7 cdcDrop=2829
+[RX] pkts=10206 drops=1 ooo=0 sboot=0 hid=6289 hidSkip=10901 hidReady=1 tgt=1 ageMs=6 cdcDrop=2869
+[RX] pkts=10306 drops=1 ooo=0 sboot=0 hid=6337 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2911
+[RX] pkts=10406 drops=1 ooo=0 sboot=0 hid=6373 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2953
+[RX] pkts=10506 drops=1 ooo=0 sboot=0 hid=6405 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=2994
+[RX] pkts=10605 drops=1 ooo=0 sboot=0 hid=6436 hidSkip=10901 hidReady=1 tgt=1 ageMs=15 cdcDrop=3035
+[RX] pkts=10706 drops=1 ooo=0 sboot=0 hid=6466 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=3076
+[RX] pkts=10806 drops=1 ooo=0 sboot=0 hid=6508 hidSkip=10901 hidReady=1 tgt=1 ageMs=1 cdcDrop=3116
+[RX] pkts=10906 drops=1 ooo=0 sboot=0 hid=6540 hidSkip=10901 hidReady=1 tgt=1 ageMs=3 cdcDrop=3158
+[RX] pkts=11006 drops=1 ooo=0 sboot=0 hid=6571 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=3200
+[RX] pkts=11106 drops=1 ooo=0 sboot=0 hid=6603 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=3240
+[RX] pkts=11206 drops=1 ooo=0 sboot=0 hid=6634 hidSkip=10901 hidReady=1 tgt=1 ageMs=2 cdcDrop=3280
+[RX] pkts=11306 drops=1 ooo=0 sboot=0 hid=6668 hidSkip=10901 hidReady=1 tgt=1 ageMs=4 cdcDrop=3320
+[RX] pkts=11406 drops=1 ooo=0 sboot=0 hid=6699 hidSkip=10901 hidReady=1 tgt=1 ageMs=5 cdcDrop=3361
+[RX] pkts=11506 drops=1 ooo=0 sboot=0 hid=6731 hidSkip=10901 hidReady=1 tgt=1 ageMs=6 cdcDrop=3403
+[RX] pkts=11606 drops=1 ooo=0 sboot=0 hid=6781 hidSkip=10901 hidReady=1 tgt=1 ageMs=6 cdcDrop=3444
+[140168][E][USBHID.cpp:362] SendReport(): report 2 wait failed
+[RX] pkts=11707 drops=1 ooo=0 sboot=0 hid=6822 hidSkip=10903 hidReady=0 tgt=1 ageMs=4 cdcDrop=3485
+[140806][E][USBHID.cpp:362] SendReport(): report 1 wait failed
+[RX] pkts=11807 drops=2 ooo=0 sboot=0 hid=6835 hidSkip=11924 hidReady=1 tgt=1 ageMs=4 cdcDrop=3529
+[TGT] target lock lost (serial quiet) — open loop
+[RX] pkts=11907 drops=2 ooo=0 sboot=0 hid=6935 hidSkip=11924 hidReady=1 tgt=0 ageMs=3 cdcDrop=3550
+[RX] pkts=12007 drops=2 ooo=0 sboot=0 hid=7034 hidSkip=11924 hidReady=1 tgt=0 ageMs=4 cdcDrop=3570
+[RX] pkts=12107 drops=2 ooo=0 sboot=0 hid=7129 hidSkip=11924 hidReady=1 tgt=0 ageMs=4 cdcDrop=3590
+[RX] pkts=12207 drops=2 ooo=0 sboot=0 hid=7229 hidSkip=11924 hidReady=1 tgt=0 ageMs=3 cdcDrop=3610
+[RX] pkts=12307 drops=2 ooo=0 sboot=0 hid=7329 hidSkip=11924 hidReady=1 tgt=0 ageMs=4 cdcDrop=3631
+[RX] pkts=12407 drops=2 ooo=0 sboot=0 hid=7339 hidSkip=11924 hidReady=1 tgt=0 ageMs=4 cdcDrop=3651
+[RX] pkts=12507 drops=2 ooo=0 sboot=0 hid=7339 hidSkip=11924 hidReady=1 tgt=0 ageMs=5 cdcDrop=3671
+[RX] pkts=12607 drops=2 ooo=0 sboot=0 hid=7339 hidSkip=11924 hidReady=1 tgt=0 ageMs=4 cdcDrop=3691
+[RX] pkts=12707 drops=2 ooo=0 sboot=0 hid=7339 hidSkip=11924 hidReady=1 tgt=0 ageMs=4 cdcDrop=3712

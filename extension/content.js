@@ -8,7 +8,7 @@
   const STORAGE_KEY = 'usbFreeDWidgetWatcherConfig';
   const SCAN_INTERVAL_MS = 220;
   const STALE_MS = 1600;
-  const BUILD_TAG = 'watcher-2026-07-16c-frozen-takeover';
+  const BUILD_TAG = 'watcher-2026-07-17c-cal-heartbeat';
   const WEBGL_ORTHO_ERR_MAX = 0.3;
   const WEBGL_CHANGE_EPS = 0.00055;
   const WEBGL_CANDIDATE_TTL_MS = 2600;
@@ -96,6 +96,18 @@
   let serialWriter = null;
   let serialConnected = false;
   let serialSeq = 0;
+  // Receiver → extension channel (same CDC port): parsed "TL," telemetry.
+  let serialReader = null;
+  let lastTelemetry = null;
+  let lastTelemetryMs = 0;
+  let lastSentQuat = null;     // last target quat written to the receiver
+  let lastTargetSentMs = 0;    // performance.now() of that write (heartbeat pacing)
+  // Auto-reconnect: a transient USB stall must not end the session — the
+  // receiver falls back to open loop while serial is down and re-enters
+  // closed loop on the next packet. Permission persists across reopen, so
+  // no user gesture is needed.
+  let serialWantReconnect = false;
+  let serialReconnectTimer = null;
   let serialBtn = null;  // panel button reference
 
   let panel = null;
@@ -1083,6 +1095,9 @@
     pointer: [],
     css: [],
     locks: [],
+    telemetry: [],   // receiver "TL," lines (closed-loop state) + host time
+    targetTx: [],    // target packets sent to the receiver
+    serialLog: [],   // other receiver output ([RX] stats etc.)
     lastMoveT: -1000,
     lastCssQuat: null,
     lastLockedId: null,
@@ -1208,6 +1223,9 @@
     diagState.pointer = [];
     diagState.css = [];
     diagState.locks = [];
+    diagState.telemetry = [];
+    diagState.targetTx = [];
+    diagState.serialLog = [];
     diagState.lastMoveT = -1000;
     diagState.lastCssQuat = null;
     diagState.lastLockedId = webglState.lockedId;
@@ -1275,6 +1293,15 @@
       pointer: diagState.pointer,
       css: diagState.css,
       streams,
+      // Closed-loop capture (present when the receiver serial was connected):
+      // telemetry = receiver control state (TL lines), targetTx = ground-truth
+      // packets we sent it, serialLog = receiver's other output.
+      serial: {
+        connected: serialConnected,
+        telemetry: diagState.telemetry,
+        targetTx: diagState.targetTx,
+        log: diagState.serialLog,
+      },
     };
 
     let saved = 'in memory';
@@ -1753,10 +1780,15 @@
     }
     try {
       serialPort = await navigator.serial.requestPort();
-      await serialPort.open({ baudRate: 115200 });
+      // Big receive buffer: the default is 255 bytes — at 50 Hz telemetry one
+      // slow frame overflows it, the reader dies, and backpressure silences
+      // the receiver's CDC output entirely.
+      await serialPort.open({ baudRate: 115200, bufferSize: 262144 });
       serialWriter = serialPort.writable.getWriter();
       serialConnected = true;
+      serialWantReconnect = true;
       serialSeq = 0;
+      startSerialReadLoop();
       console.log('[USB_freeD] Serial connected');
       updatePanel();
     } catch (e) {
@@ -1771,16 +1803,125 @@
     }
   }
 
+  // A serial failure (write error, read stream ending unexpectedly) tears
+  // down the connection and starts the reconnect loop. NEVER a dead end:
+  // the port permission is durable, so reopen needs no user gesture.
+  function handleSerialFailure(reason) {
+    const wasConnected = serialConnected;
+    serialConnected = false;
+    try { if (serialWriter) serialWriter.releaseLock(); } catch (e) { /* already released */ }
+    serialWriter = null;
+    try { if (serialReader) serialReader.cancel().catch(() => {}); } catch (e) { /* already gone */ }
+    if (wasConnected) console.warn('[USB_freeD] serial failed (' + reason + ') — auto-reconnecting');
+    scheduleSerialReconnect();
+    updatePanel();
+  }
+
+  function scheduleSerialReconnect() {
+    if (!serialWantReconnect || serialReconnectTimer || serialConnected) return;
+    serialReconnectTimer = window.setTimeout(async () => {
+      serialReconnectTimer = null;
+      if (!serialWantReconnect || serialConnected) return;
+      try {
+        let port = serialPort;
+        if (!port && navigator.serial && navigator.serial.getPorts) {
+          const ports = await navigator.serial.getPorts();
+          port = ports && ports.length ? ports[0] : null;
+        }
+        if (!port) throw new Error('no granted port');
+        try { await port.close(); } catch (e) { /* wasn't open */ }
+        await port.open({ baudRate: 115200, bufferSize: 262144 });
+        serialPort = port;
+        serialWriter = port.writable.getWriter();
+        serialConnected = true;
+        startSerialReadLoop();
+        console.log('[USB_freeD] Serial reconnected');
+        updatePanel();
+      } catch (e) {
+        scheduleSerialReconnect(); // keep trying until manual disconnect
+      }
+    }, 1000);
+  }
+
   async function disconnectSerial() {
     serialConnected = false;
+    serialWantReconnect = false;
+    if (serialReconnectTimer) { window.clearTimeout(serialReconnectTimer); serialReconnectTimer = null; }
     try {
+      if (serialReader) { try { await serialReader.cancel(); } catch (e) { /* reader already gone */ } }
       if (serialWriter) { serialWriter.releaseLock(); serialWriter = null; }
       if (serialPort) { await serialPort.close(); serialPort = null; }
     } catch (e) {
       // ignore close errors
     }
+    lastTelemetry = null;
     console.log('[USB_freeD] Serial disconnected');
     updatePanel();
+  }
+
+  // Receiver → extension: continuously drain the CDC stream. Without a
+  // reader, Chrome's receive buffer fills and incoming data is dropped —
+  // and the receiver's "TL," telemetry lines are the system recorder's
+  // view into the closed loop (device quat, view estimate, error, HID cmd).
+  async function startSerialReadLoop() {
+    if (!serialPort || !serialPort.readable) return;
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      serialReader = serialPort.readable.getReader();
+      while (serialConnected && serialReader) {
+        const { value, done } = await serialReader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          handleSerialLine(buf.slice(0, idx).trim());
+          buf = buf.slice(idx + 1);
+        }
+        if (buf.length > 8192) buf = ''; // never let a missing newline grow the buffer
+      }
+    } catch (e) {
+      // port unplugged or cancelled — failure handling below
+    } finally {
+      try { if (serialReader) serialReader.releaseLock(); } catch (e) { /* already released */ }
+      serialReader = null;
+      // If we still thought we were connected, the stream died on us
+      // (USB stall, re-enumeration) — recover instead of going silent.
+      if (serialConnected) handleSerialFailure('read-ended');
+    }
+  }
+
+  function handleSerialLine(line) {
+    if (!line) return;
+    const tHost = performance.now();
+    if (line.startsWith('TL,')) {
+      const p = line.split(',');
+      if (p.length >= 21) {
+        lastTelemetry = {
+          tHost,
+          deviceMs: +p[1],
+          seqIn: +p[2],
+          seqTgt: +p[3],
+          qDev: { w: +p[4], x: +p[5], y: +p[6], z: +p[7] },
+          qView: { w: +p[8], x: +p[9], y: +p[10], z: +p[11] },
+          err: { x: +p[12], y: +p[13], z: +p[14] },
+          hid: { x: +p[15], y: +p[16], z: +p[17] },
+          send: +p[18],
+          converging: +p[19],
+          motion: +p[20],
+        };
+        lastTelemetryMs = tHost;
+        if (diagState.active && diagState.telemetry.length < 20000) {
+          diagState.telemetry.push([Math.round(tHost - diagState.startMs), line]);
+        }
+      }
+      return;
+    }
+    // Non-telemetry receiver output ([RX] stats, boot banners): keep a capped
+    // copy in the recording — link-quality context for the same time window.
+    if (diagState.active && diagState.serialLog.length < 2000) {
+      diagState.serialLog.push([Math.round(tHost - diagState.startMs), line]);
+    }
   }
 
   function sendTargetPacket(quat) {
@@ -1796,6 +1937,14 @@
     view.setFloat32(13, quat.z, true);
     view.setUint8(17, serialSeq & 0xFF);
 
+    if (diagState.active && diagState.targetTx.length < 20000) {
+      diagState.targetTx.push([
+        Math.round(performance.now() - diagState.startMs),
+        serialSeq & 0xFF,
+        +quat.w.toFixed(4), +quat.x.toFixed(4), +quat.y.toFixed(4), +quat.z.toFixed(4),
+      ]);
+    }
+
     // Checksum: XOR of bytes 1..17
     let cs = 0;
     const bytes = new Uint8Array(buf);
@@ -1803,14 +1952,41 @@
     view.setUint8(18, cs);
 
     serialSeq = (serialSeq + 1) & 0xFF;
+    lastSentQuat = { w: quat.w, x: quat.x, y: quat.y, z: quat.z };
+    lastTargetSentMs = performance.now();
 
     // Fire-and-forget: write is async but we don't await to avoid blocking the tick loop
     serialWriter.write(bytes).catch((e) => {
       console.warn('[USB_freeD] serial write failed:', e);
-      serialConnected = false;
-      serialWriter = null;
-      updatePanel();
+      handleSerialFailure('write');
     });
+  }
+
+  // Onshape only renders when something changes, so the publish stream goes
+  // quiet on a static scene — the receiver's 500ms lock timeout then flaps
+  // the system between closed and open loop (field UART log 2026-07-16:
+  // repeated "[TGT] target lock lost"). Re-send the last known view quat at
+  // ~20 Hz while idle so the lock holds; a repeated quat is still truthful
+  // ("view hasn't moved") and the receiver's deadzone keeps it quiescent.
+  function serialHeartbeat(nowMs) {
+    if (!serialConnected || !lastSentQuat) return;
+    if (nowMs - lastTargetSentMs < 50) return;
+    sendTargetPacket(lastSentQuat);
+  }
+
+  // HID→velocity plant calibration: tell the receiver to run its open-loop
+  // staircase (target_packet.h CAL_*). Record a diag during the run — the
+  // capture then contains both the commanded steps (serial log "CAL," lines)
+  // and Onshape's true response (targetTx), enough to fit the velocity curve
+  // and dead time offline.
+  function sendCalCommand(cmd) {
+    if (!serialConnected || !serialWriter) return;
+    const bytes = new Uint8Array([0xCC, cmd, 0xCC ^ cmd]);
+    serialWriter.write(bytes).catch((e) => {
+      console.warn('[USB_freeD] cal command write failed:', e);
+      handleSerialFailure('write');
+    });
+    console.log('[USB_freeD] cal command sent:', cmd);
   }
 
   function publishOrientation(nowMs) {
@@ -3196,6 +3372,7 @@
           <button id="usb-freed-watch-toggle" class="usb-freed-btn usb-freed-btn-sm">Watcher ON</button>
           <button id="usb-freed-watch-fallback" class="usb-freed-btn usb-freed-btn-sm">Secondary: Auto</button>
           <button id="usb-freed-serial-btn" class="usb-freed-btn usb-freed-btn-sm">Serial: OFF</button>
+          <button id="usb-freed-loopcal-btn" class="usb-freed-btn usb-freed-btn-sm" title="Run the receiver's ~40s HID→velocity staircase. Start a Record diag first so the response is captured. Shift-click aborts.">Cal motion</button>
         </div>
 
         <div class="usb-freed-row">
@@ -3257,6 +3434,20 @@
     serialBtn.addEventListener('click', () => {
       connectSerial();
     });
+
+    const loopCalBtn = panel.querySelector('#usb-freed-loopcal-btn');
+    if (loopCalBtn) {
+      loopCalBtn.addEventListener('click', (ev) => {
+        if (ev.shiftKey) {
+          sendCalCommand(0x02);  // abort
+          return;
+        }
+        // The staircase runs ~41s; a default 31s diag cuts off the z axis.
+        // Auto-start a long-enough recording so one click captures it all.
+        if (!diagState.active) diagStart(55);
+        sendCalCommand(0x01);
+      });
+    }
 
     // Suspend option rebuilds while the select is focused/unfurled — rebuilding
     // a native select's options mid-interaction detaches its popup.
@@ -3322,7 +3513,7 @@
     toggleBtn.textContent = config.watcherEnabled ? 'Watcher ON' : 'Watcher OFF';
     toggleBtn.classList.toggle('usb-freed-btn-active', config.watcherEnabled);
     fallbackBtn.textContent = fallbackModeLabel(config.fallbackMode);
-    serialBtn.textContent = serialConnected ? 'Serial: ON' : 'Serial: OFF';
+    serialBtn.textContent = serialConnected ? 'Serial: ON' : (serialWantReconnect ? 'Serial: RETRY…' : 'Serial: OFF');
     serialBtn.classList.toggle('usb-freed-btn-active', serialConnected);
     refreshSourceControls(performance.now());
     sourceSelect.disabled = !config.watcherEnabled;
@@ -3330,7 +3521,12 @@
     clearCalBtn.classList.toggle('usb-freed-btn-active', calOn);
 
     const nowMs = performance.now();
-    const serialSuffix = serialConnected ? ' | serial: ON' : '';
+    // "loop✓" = fresh TL telemetry from the receiver: the full closed loop
+    // (extension → receiver → HID) is alive, not just the serial port open.
+    // "loop✗" while connected = receiver output is not reaching us — the
+    // exact condition that produced an empty telemetry capture.
+    const loopLive = serialConnected && lastTelemetryMs && (nowMs - lastTelemetryMs) < 500;
+    const serialSuffix = serialConnected ? (loopLive ? ' | serial: ON loop✓' : ' | serial: ON loop✗') : '';
 
     if (diagBtn) diagBtn.textContent = diagState.active ? 'REC…' : 'Record diag';
     if (diagState.active) {
@@ -3367,17 +3563,24 @@
       ? ' | PINNED'
       : (config.preferredWebglSource ? ' | saved pref active' : '');
 
+    // Fixed-width numeric fields first, variable-length debug text last, so
+    // the line doesn't reflow as the live values tick (noteEl is monospace
+    // with pre-wrap, so the padding survives rendering).
+    const ageStr = String(Math.min(ageMs, 99999)).padStart(5, ' ');
+    const hzStr = String(Math.min(displayHz, 999)).padStart(3, ' ');
+    const statusHead = 'age ' + ageStr + 'ms | ' + hzStr + ' Hz' + serialSuffix + steerSuffix;
+
     if (!observerQuat || stale) {
       calibrateBtn.disabled = true;
       clearCalBtn.disabled = !calOn;
-      noteEl.textContent = observerDebug + (observerLastUpdateMs ? (' | last sample ' + ageMs + 'ms ago') : '') + ' | ' + displayHz + ' Hz' + steerSuffix + serialSuffix;
+      noteEl.textContent = statusHead + ' | ' + observerDebug;
       drawOrientationPreview(observerQuat, true);
       return;
     }
 
     calibrateBtn.disabled = false;
     clearCalBtn.disabled = !calOn;
-    noteEl.textContent = observerDebug + ' | age ' + ageMs + 'ms | ' + displayHz + ' Hz' + steerSuffix + serialSuffix;
+    noteEl.textContent = statusHead + ' | ' + observerDebug;
     drawOrientationPreview(observerQuat, false);
   }
 
@@ -3385,6 +3588,7 @@
     try {
       const nowMs = performance.now();
       scanWidgetOrientation(nowMs);
+      serialHeartbeat(nowMs);
       diagTick(nowMs);
       updatePanel();
     } catch (err) {
@@ -3452,7 +3656,9 @@
       clearCalibration: () => clearCalibration(),
       connectSerial: () => connectSerial(),
       disconnectSerial: () => disconnectSerial(),
-      getSerialState: () => ({ connected: serialConnected, seq: serialSeq }),
+      getSerialState: () => ({ connected: serialConnected, seq: serialSeq, lastTelemetry }),
+      startMotionCal: () => sendCalCommand(0x01),
+      abortMotionCal: () => sendCalCommand(0x02),
     };
     window.setInterval(tick, 30);
     tick();

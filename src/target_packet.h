@@ -56,3 +56,14 @@ inline bool verifyTargetPacket(const TargetPacket& pkt) {
     if (pkt.header != TARGET_HEADER) return false;
     return computeTargetChecksum(pkt) == pkt.checksum;
 }
+
+// Calibration command: extension → receiver, 3 bytes on the same CDC stream.
+//   [0] 0xCC   [1] cmd   [2] checksum = 0xCC ^ cmd
+// CAL_CMD_START_ROT drives a deterministic open-loop HID staircase (each
+// axis, ± several magnitudes) while the extension records the true Onshape
+// response — offline analysis yields the real HID→velocity curve and loop
+// dead time, replacing guessed control constants with measured ones.
+static const uint8_t CAL_HEADER         = 0xCC;
+static const uint8_t CAL_PACKET_SIZE    = 3;
+static const uint8_t CAL_CMD_START_ROT  = 0x01;
+static const uint8_t CAL_CMD_ABORT      = 0x02;

@@ -238,11 +238,15 @@
 /* ===== Calibration hint ===== */
 
 .usb-freed-hint {
+  /* Monospace + preserved spaces: the status line is built with padded
+     fixed-width fields so live values don't shift the text around. */
+  font-family: ui-monospace, Menlo, monospace;
   font-size: 10px;
   color: #6c7086;
   line-height: 1.3;
   margin-bottom: 6px;
   padding: 0 2px;
+  white-space: pre-wrap;
 }
 
 .usb-freed-preview-wrap {

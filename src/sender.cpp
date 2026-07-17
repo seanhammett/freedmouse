@@ -6,6 +6,7 @@
 #include <CodeCell.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <esp_pm.h>
 #include "espnow_packet.h"
 
@@ -26,6 +27,7 @@ static uint8_t receiverMAC[] = {0x90, 0xE5, 0xB1, 0xCE, 0x1C, 0xD4}; // new esp3
 CodeCell myCodeCell;
 ImuEspNowPacket pkt;
 uint8_t seqNum = 0;
+uint8_t bootId = 0;  // random nonzero per boot; lets the receiver detect sender reboots
 bool espNowReady = false;
 uint8_t batteryLevel = 0;
 uint32_t lastBatteryReadMs = 0;
@@ -47,10 +49,18 @@ static void updateStatusLed(uint32_t nowMs) {
     }
 }
 
+// Link diagnostics — printed at 1 Hz from loop()
+volatile uint32_t txOkCount = 0;
+volatile uint32_t txFailCount = 0;
+uint32_t lastStatsMs = 0;
+
 // =================== CALLBACKS ===================
 void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
     if (status != ESP_NOW_SEND_SUCCESS) {
+        txFailCount++;
         sendFailurePending = true;
+    } else {
+        txOkCount++;
     }
 }
 
@@ -69,6 +79,11 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
+    // Pin the radio to an explicit channel and keep it awake. Sender and
+    // receiver MUST agree on the channel; relying on the post-disconnect
+    // default leaves that implicit.
+    WiFi.setSleep(false);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
     // Power management: CPU max 80MHz, light sleep between ticks (~10x idle current reduction)
     esp_pm_config_t pmConfig = {
@@ -105,6 +120,7 @@ void setup() {
     }
 
     espNowReady = true;
+    bootId = (uint8_t)(esp_random() % 255) + 1;  // 1..255, never 0
     batteryLevel = (uint8_t)myCodeCell.BatteryLevelRead();
     lastBatteryReadMs = millis();
     myCodeCell.LED(0, 0, 0);
@@ -152,9 +168,18 @@ void loop() {
         pkt.flags = flags;
         pkt.battery = batteryLevel;
         pkt.seq = seqNum++;
+        pkt.bootId = bootId;
 
         // Send
         esp_now_send(receiverMAC, (const uint8_t*)&pkt, sizeof(pkt));
+    }
+
+    // 1 Hz link stats: fail>0 means the receiver is not ACKing (off, wrong
+    // MAC, or wrong channel); ok counting up means the RF link is delivering.
+    if ((nowMs - lastStatsMs) >= 1000) {
+        lastStatsMs = nowMs;
+        Serial.printf("[TX] ok=%lu fail=%lu seq=%u\n",
+                      (unsigned long)txOkCount, (unsigned long)txFailCount, seqNum);
     }
 
     updateStatusLed(nowMs);

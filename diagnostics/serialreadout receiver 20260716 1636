@@ -1,0 +1,131 @@
+ *  Executing task: platformio device monitor --environment receiver --port /dev/cu.usbserial-1120 
+
+--- Terminal on /dev/cu.usbserial-1120 | 115200 8-N-1
+--- Available filters and text transformations: debug, default, direct, esp32_exception_decoder, hexlify, log2file, nocontrol, printable, send_on_enter, time
+--- More details at https://bit.ly/pio-monitor-filters
+--- Quit: Ctrl+C | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H
+[RX] pkts=1731 drops=22 ooo=0 hid=66 hidSkip=0 hidReady=1 tgt=0 ageMs=2
+[RX] pkts=1831 drops=22 ooo=0 hid=66 hidSkip=0 hidReady=1 tgt=0 ageMs=4
+[RX] pkts=1922 drops=22 ooo=0 hid=66 hidSkip=0 hidReady=1 tgt=0 ageMs=3
+[RX] pkts=1973 drops=22 ooo=0 hid=66 hidSkip=0 hidReady=1 tgt=0 ageMs=491
+[RX] pkts=1973 drops=22 ooo=0 hid=66 hidSkip=0 hidReady=1 tgt=0 ageMs=1491
+[RX] pkts=1973 drops=22 ooo=0 hid=66 hidSkip=0 hidReady=1 tgt=0 ageMs=2491
+[RX] pkts=2039 drops=22 ooo=1 hid=131 hidSkip=0 hidReady=1 tgt=0 ageMs=4
+[RX] pkts=2139 drops=22 ooo=1 hid=231 hidSkip=0 hidReady=1 tgt=0 ageMs=4
+[RX] pkts=2176 drops=22 ooo=1 hid=266 hidSkip=0 hidReady=1 tgt=0 ageMs=630
+[RX] pkts=2176 drops=22 ooo=1 hid=266 hidSkip=0 hidReady=1 tgt=0 ageMs=1630
+[RX] pkts=2176 drops=22 ooo=1 hid=266 hidSkip=0 hidReady=1 tgt=0 ageMs=2630
+[RX] pkts=2176 drops=22 ooo=1 hid=266 hidSkip=0 hidReady=1 tgt=0 ageMs=3630
+[RX] pkts=2176 drops=22 ooo=1 hid=266 hidSkip=0 hidReady=1 tgt=0 ageMs=4630
+[RX] pkts=2176 drops=22 ooo=1 hid=266 hidSkip=0 hidReady=1 tgt=0 ageMs=5630
+[RX] pkts=2176 drops=22 ooo=1 hid=266 hidSkip=0 hidReady=1 tgt=0 ageMs=6630
+[RX] pkts=2254 drops=75 ooo=1 hid=344 hidSkip=0 hidReady=1 tgt=0 ageMs=12
+[RX] pkts=2276 drops=75 ooo=1 hid=366 hidSkip=0 hidReady=1 tgt=0 ageMs=790
+[RX] pkts=2276 drops=75 ooo=1 hid=366 hidSkip=0 hidReady=1 tgt=0 ageMs=1790
+[RX] pkts=2276 drops=75 ooo=1 hid=366 hidSkip=0 hidReady=1 tgt=0 ageMs=2790
+[RX] pkts=2276 drops=75 ooo=1 hid=366 hidSkip=0 hidReady=1 tgt=0 ageMs=3790
+[RX] pkts=2311 drops=75 ooo=2 hid=400 hidSkip=0 hidReady=1 tgt=0 ageMs=8
+[RX] pkts=2376 drops=75 ooo=2 hid=465 hidSkip=0 hidReady=1 tgt=0 ageMs=358
+[RX] pkts=2376 drops=75 ooo=2 hid=465 hidSkip=0 hidReady=1 tgt=0 ageMs=1358
+[RX] pkts=2376 drops=75 ooo=2 hid=465 hidSkip=0 hidReady=1 tgt=0 ageMs=2358
+[RX] pkts=2376 drops=75 ooo=2 hid=465 hidSkip=0 hidReady=1 tgt=0 ageMs=3358
+[RX] pkts=2376 drops=75 ooo=2 hid=465 hidSkip=0 hidReady=1 tgt=0 ageMs=4358
+[RX] pkts=2467 drops=75 ooo=3 hid=555 hidSkip=0 hidReady=1 tgt=0 ageMs=4
+[RX] pkts=2476 drops=75 ooo=3 hid=564 hidSkip=0 hidReady=1 tgt=0 ageMs=914
+[RX] pkts=2476 drops=75 ooo=3 hid=564 hidSkip=0 hidReady=1 tgt=0 ageMs=1914
+[RX] pkts=2476 drops=75 ooo=3 hid=564 hidSkip=0 hidReady=1 tgt=0 ageMs=2914
+[RX] pkts=2476 drops=75 ooo=3 hid=564 hidSkip=0 hidReady=1 tgt=0 ageMs=3914
+[RX] pkts=2524 drops=75 ooo=4 hid=611 hidSkip=0 hidReady=1 tgt=0 ageMs=1
+[RX] pkts=2576 drops=75 ooo=4 hid=663 hidSkip=0 hidReady=1 tgt=0 ageMs=482
+[RX] pkts=2576 drops=75 ooo=4 hid=663 hidSkip=0 hidReady=1 tgt=0 ageMs=1482
+[RX] pkts=2576 drops=75 ooo=4 hid=663 hidSkip=0 hidReady=1 tgt=0 ageMs=2482
+[RX] pkts=2576 drops=75 ooo=4 hid=663 hidSkip=0 hidReady=1 tgt=0 ageMs=3482
+[RX] pkts=2580 drops=75 ooo=5 hid=666 hidSkip=0 hidReady=1 tgt=0 ageMs=9
+[RX] pkts=2676 drops=75 ooo=5 hid=762 hidSkip=0 hidReady=1 tgt=0 ageMs=50
+[RX] pkts=2676 drops=75 ooo=5 hid=762 hidSkip=0 hidReady=1 tgt=0 ageMs=1050
+[RX] pkts=2676 drops=75 ooo=5 hid=762 hidSkip=0 hidReady=1 tgt=0 ageMs=2050
+[RX] pkts=2676 drops=75 ooo=5 hid=762 hidSkip=0 hidReady=1 tgt=0 ageMs=3050
+[RX] pkts=2676 drops=75 ooo=5 hid=762 hidSkip=0 hidReady=1 tgt=0 ageMs=4050
+[RX] pkts=2736 drops=75 ooo=6 hid=821 hidSkip=0 hidReady=1 tgt=0 ageMs=5
+[RX] pkts=2776 drops=75 ooo=6 hid=861 hidSkip=0 hidReady=1 tgt=0 ageMs=601
+[RX] pkts=2776 drops=75 ooo=6 hid=861 hidSkip=0 hidReady=1 tgt=0 ageMs=1601
+[RX] pkts=2776 drops=75 ooo=6 hid=861 hidSkip=0 hidReady=1 tgt=0 ageMs=2601
+[RX] pkts=2776 drops=75 ooo=6 hid=861 hidSkip=0 hidReady=1 tgt=0 ageMs=3601
+[RX] pkts=2793 drops=75 ooo=7 hid=866 hidSkip=0 hidReady=1 tgt=1 ageMs=3
+[RX] pkts=2876 drops=75 ooo=7 hid=901 hidSkip=0 hidReady=1 tgt=1 ageMs=175
+[RX] pkts=2876 drops=75 ooo=7 hid=901 hidSkip=0 hidReady=1 tgt=1 ageMs=1175
+[RX] pkts=2876 drops=75 ooo=7 hid=901 hidSkip=0 hidReady=1 tgt=1 ageMs=2175
+[RX] pkts=2876 drops=75 ooo=7 hid=901 hidSkip=0 hidReady=1 tgt=1 ageMs=3175
+[RX] pkts=2876 drops=75 ooo=7 hid=901 hidSkip=0 hidReady=1 tgt=1 ageMs=4175
+[RX] pkts=2950 drops=75 ooo=8 hid=921 hidSkip=0 hidReady=1 tgt=1 ageMs=6
+[RX] pkts=2976 drops=75 ooo=8 hid=928 hidSkip=0 hidReady=1 tgt=1 ageMs=746
+[RX] pkts=2976 drops=75 ooo=8 hid=928 hidSkip=0 hidReady=1 tgt=1 ageMs=1746
+[RX] pkts=2976 drops=75 ooo=8 hid=928 hidSkip=0 hidReady=1 tgt=1 ageMs=2746
+[RX] pkts=2976 drops=75 ooo=8 hid=928 hidSkip=0 hidReady=1 tgt=1 ageMs=3746
+[RX] pkts=3007 drops=75 ooo=9 hid=938 hidSkip=0 hidReady=1 tgt=1 ageMs=3
+[RX] pkts=3076 drops=75 ooo=9 hid=961 hidSkip=0 hidReady=1 tgt=1 ageMs=315
+[RX] pkts=3076 drops=75 ooo=9 hid=961 hidSkip=0 hidReady=1 tgt=1 ageMs=1315
+[RX] pkts=3076 drops=75 ooo=9 hid=961 hidSkip=0 hidReady=1 tgt=1 ageMs=2315
+[RX] pkts=3076 drops=75 ooo=9 hid=961 hidSkip=0 hidReady=1 tgt=1 ageMs=3315
+[RX] pkts=3076 drops=75 ooo=9 hid=961 hidSkip=0 hidReady=1 tgt=1 ageMs=4315
+[RX] pkts=3164 drops=75 ooo=10 hid=991 hidSkip=0 hidReady=1 tgt=1 ageMs=3
+[RX] pkts=3176 drops=75 ooo=10 hid=994 hidSkip=0 hidReady=1 tgt=1 ageMs=885
+[RX] pkts=3176 drops=75 ooo=10 hid=994 hidSkip=0 hidReady=1 tgt=1 ageMs=1885
+[RX] pkts=3176 drops=75 ooo=10 hid=994 hidSkip=0 hidReady=1 tgt=1 ageMs=2885
+[RX] pkts=3176 drops=75 ooo=10 hid=994 hidSkip=0 hidReady=1 tgt=1 ageMs=3885
+[RX] pkts=3221 drops=75 ooo=11 hid=1016 hidSkip=0 hidReady=1 tgt=1 ageMs=3
+[RX] pkts=3276 drops=75 ooo=11 hid=1039 hidSkip=0 hidReady=1 tgt=1 ageMs=453
+[RX] pkts=3276 drops=75 ooo=11 hid=1039 hidSkip=0 hidReady=1 tgt=1 ageMs=1453
+[RX] pkts=3276 drops=75 ooo=11 hid=1039 hidSkip=0 hidReady=1 tgt=1 ageMs=2453
+[RX] pkts=3276 drops=75 ooo=11 hid=1039 hidSkip=0 hidReady=1 tgt=1 ageMs=3453
+[RX] pkts=3276 drops=75 ooo=11 hid=1039 hidSkip=0 hidReady=1 tgt=1 ageMs=4453
+[ 94030][E][USBHID.cpp:362] SendReport(): report 1 wait failed
+E (106933) task_wdt: Task watchdog got triggered. The following tasks/users did notreset the watchdog in time:
+E (106933) task_wdt:  - loopTask (CPU 1)
+E (106933) task_wdt: Tasks currently running:
+E (106933) task_wdt: CPU 0: IDLE0
+E (106933) task_wdt: CPU 1: loopTask
+E (106933) task_wdt: Aborting.
+E (106933) task_wdt: Print CPU 1 backtrace
+
+
+
+
+Backtrace: 0x42048281:0x3fcb0960 0x420075e6:0x3fcb0980 0x42006c5e:0x3fcb09b0 0x42006c9b:0x3fcb0a30 0x42003fe6:0x3fcb0a80 0x4200a874:0x3fcb0c60 0x4037f556:0x3fcb0c80
+
+
+
+
+ELF file SHA256: 021f5d141
+
+Rebooting...
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4200eb54
+SPIWP:0xee
+Octal Flash Mode Enabled
+For OPI Flash, Use Default Flash Boot Mode
+mode:SLOW_RD, clock div:1
+load:0x3fce2810,len:0x1074
+load:0x403c8700,len:0x4
+load:0x403c8704,len:0xac0
+load:0x403cb700,len:0x2e58
+entry 0x403c8890
+
+=== USB_freeD receiver (UART mirror) ===
+[BOOT] reset reason: 6 (CRASH!)
+[OK] loop watchdog armed (4s)
+[RX] pkts=0 drops=0 ooo=0 hid=0 hidSkip=0 hidReady=0 tgt=0 ageMs=0
+[RX] pkts=85 drops=0 ooo=0 hid=84 hidSkip=198 hidReady=0 tgt=0 ageMs=3
+[RX] pkts=185 drops=0 ooo=0 hid=184 hidSkip=398 hidReady=0 tgt=0 ageMs=5
+[RX] pkts=285 drops=0 ooo=0 hid=284 hidSkip=598 hidReady=0 tgt=0 ageMs=5
+[RX] pkts=385 drops=0 ooo=0 hid=352 hidSkip=1400 hidReady=0 tgt=0 ageMs=2
+[RX] pkts=485 drops=0 ooo=0 hid=452 hidSkip=1600 hidReady=0 tgt=0 ageMs=5
+[RX] pkts=585 drops=0 ooo=0 hid=552 hidSkip=1800 hidReady=0 tgt=0 ageMs=5
+[RX] pkts=685 drops=0 ooo=0 hid=651 hidSkip=2018 hidReady=0 tgt=0 ageMs=4
+[RX] pkts=785 drops=0 ooo=0 hid=751 hidSkip=2218 hidReady=0 tgt=0 ageMs=5
+[RX] pkts=885 drops=0 ooo=0 hid=845 hidSkip=2524 hidReady=0 tgt=0 ageMs=4
+[RX] pkts=985 drops=0 ooo=0 hid=945 hidSkip=2724 hidReady=0 tgt=0 ageMs=5
+[RX] pkts=1085 drops=0 ooo=0 hid=1034 hidSkip=3112 hidReady=0 tgt=0 ageMs=5
+[RX] pkts=1185 drops=0 ooo=0 hid=1034 hidSkip=5112 hidReady=0 tgt=0 ageMs=5
